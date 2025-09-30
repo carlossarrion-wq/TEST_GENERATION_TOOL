@@ -1,0 +1,119 @@
+import json
+import logging
+import boto3
+import uuid
+from datetime import datetime
+from typing import Dict, Any
+import os
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+dynamodb = boto3.resource('dynamodb')
+sessions_table = dynamodb.Table(os.environ.get('SESSIONS_TABLE', 'test-plan-sessions'))
+
+def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
+    """POST /configure-plan - Configurar un nuevo plan de pruebas"""
+    try:
+        if event.get('httpMethod') == 'OPTIONS':
+            return cors_response()
+        
+        # Manejo robusto del body - soporta API Gateway y invocación directa
+        try:
+            logger.info(f"Lambda invoked with event: {json.dumps(event, default=str)}")
+            
+            if 'body' in event:
+                # Formato API Gateway
+                if event['body'] is None:
+                    return error_response(400, 'Request body is null')
+                
+                if isinstance(event['body'], str):
+                    body = json.loads(event['body'])
+                else:
+                    body = event['body']
+            else:
+                # Invocación directa - el evento ES el body
+                body = event
+                logger.info("Direct invocation detected, using event as body")
+                
+        except json.JSONDecodeError as e:
+            return error_response(400, f'Invalid JSON in request body: {str(e)}')
+        except Exception as e:
+            return error_response(400, f'Error parsing request body: {str(e)}')
+        
+        required_fields = ['plan_title', 'plan_type', 'coverage_percentage', 'project_context']
+        missing_fields = [field for field in required_fields if field not in body]
+        
+        if missing_fields:
+            return error_response(400, f'Missing required fields: {", ".join(missing_fields)}')
+        
+        valid_plan_types = ['UNITARIAS', 'INTEGRACIÓN', 'PERFORMANCE', 'REGRESIÓN']
+        if body['plan_type'] not in valid_plan_types:
+            return error_response(400, f'Invalid plan_type. Must be one of: {", ".join(valid_plan_types)}')
+        
+        coverage = body['coverage_percentage']
+        if not isinstance(coverage, (int, float)) or coverage < 10 or coverage > 100:
+            return error_response(400, 'Coverage percentage must be between 10 and 100')
+        
+        session_id = str(uuid.uuid4())
+        current_time = datetime.utcnow().isoformat()
+        
+        plan_configuration = {
+            'plan_title': body['plan_title'],
+            'plan_type': body['plan_type'],
+            'coverage_percentage': coverage,
+            'project_context': body['project_context']
+        }
+        
+        session_data = {
+            'id': session_id,
+            'tester_id': body.get('tester_id', 'anonymous'),
+            'project_context': body['project_context'],
+            'plan_configuration': plan_configuration,
+            'iterations': [],
+            'status': 'active',
+            'created_at': current_time,
+            'updated_at': current_time
+        }
+        
+        sessions_table.put_item(Item=session_data)
+        
+        return success_response({
+            'session_id': session_id,
+            'plan_configuration': plan_configuration,
+            'status': 'configured',
+            'message': 'Plan configuration saved successfully'
+        })
+        
+    except Exception as e:
+        logger.error(f"Error: {str(e)}")
+        return error_response(500, 'Internal server error', str(e))
+
+def success_response(data):
+    return {
+        'statusCode': 200,
+        'headers': cors_headers(),
+        'body': json.dumps({**data, 'timestamp': datetime.utcnow().isoformat()})
+    }
+
+def error_response(status_code, message, details=None):
+    return {
+        'statusCode': status_code,
+        'headers': cors_headers(),
+        'body': json.dumps({
+            'error': message,
+            'details': details,
+            'timestamp': datetime.utcnow().isoformat()
+        })
+    }
+
+def cors_response():
+    return {'statusCode': 200, 'headers': cors_headers(), 'body': ''}
+
+def cors_headers():
+    return {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token',
+        'Access-Control-Allow-Methods': 'POST,OPTIONS'
+    }
