@@ -1,0 +1,1 @@
+{"statusCode": 500, "headers": {"Content-Type": "application/json", "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Headers": "Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token", "Access-Control-Allow-Methods": "POST,OPTIONS"}, "body": "{\"error\": \"Error retrieving session data\", \"details\": null, \"timestamp\": \"2025-10-02T10:59:26.797854\"}"}

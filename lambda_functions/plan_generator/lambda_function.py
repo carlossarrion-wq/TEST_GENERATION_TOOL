@@ -4,6 +4,7 @@ import boto3
 from datetime import datetime
 from typing import Dict, Any, List
 import os
+from decimal import Decimal
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -14,15 +15,27 @@ dynamodb = boto3.resource('dynamodb')
 
 sessions_table = dynamodb.Table(os.environ.get('SESSIONS_TABLE', 'test-plan-sessions'))
 knowledge_base_id = os.environ.get('KNOWLEDGE_BASE_ID')
-model_id = os.environ.get('BEDROCK_MODEL_ID', 'anthropic.claude-sonnet-4-20250514-v1:0')
+# Usar Inference Profile para Claude Sonnet 4
+model_id = os.environ.get('BEDROCK_MODEL_ID', 'arn:aws:bedrock:eu-west-1:701055077130:inference-profile/eu.anthropic.claude-sonnet-4-20250514-v1:0')
+
+def decimal_default(obj):
+    """Helper function to convert Decimal objects to float for JSON seraialization"""
+    if isinstance(obj, Decimal):
+        return float(obj)
+    raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
 
 def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
     """POST /generate-plan - Generar plan de pruebas usando Claude y Knowledge Base"""
+    logger.info("=== PLAN_GENERATOR STARTED ===")
+    
     try:
-        logger.info(f"Lambda invoked with event: {json.dumps(event, default=str)}")
+        logger.info(f"Raw event received: {json.dumps(event, default=str)}")
         
         if event.get('httpMethod') == 'OPTIONS':
+            logger.info("OPTIONS request detected, returning CORS response")
             return cors_response()
+        
+        logger.info("Processing POST request")
         
         # Manejo robusto del body - soporta API Gateway y invocación directa
         try:
@@ -54,14 +67,27 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
         session_id = body['session_id']
         user_instructions = body.get('user_instructions', '')
         
+        logger.info(f"Searching for session with ID: {session_id}")
+        
         # Get session data
         try:
             session_response = sessions_table.get_item(Key={'id': session_id})
+            logger.info(f"DynamoDB get_item response: {json.dumps(session_response, default=str)}")
+            
             if 'Item' not in session_response:
-                return error_response(404, 'Session not found')
+                logger.error(f"Session not found in DynamoDB. Session ID: {session_id}")
+                # Let's also try to list all sessions to debug
+                try:
+                    scan_response = sessions_table.scan(Limit=5)
+                    logger.info(f"Available sessions (first 5): {json.dumps(scan_response.get('Items', []), default=str)}")
+                except Exception as scan_error:
+                    logger.error(f"Error scanning sessions table: {str(scan_error)}")
+                
+                return error_response(404, f'Session not found: {session_id}')
             
             session_data = session_response['Item']
             plan_config = session_data['plan_configuration']
+            logger.info(f"Session found successfully: {session_data.get('id', 'unknown')}")
         except Exception as e:
             logger.error(f"Error retrieving session: {str(e)}")
             return error_response(500, 'Error retrieving session data')
@@ -87,7 +113,7 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
                     for result in kb_response['retrievalResults']:
                         context_results.append({
                             'content': result.get('content', {}).get('text', ''),
-                            'score': result.get('score', 0.0)
+                            'score': Decimal(str(result.get('score', 0.0)))
                         })
                 
                 logger.info(f"Retrieved {len(context_results)} context results from Knowledge Base")
@@ -95,127 +121,109 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
             except Exception as e:
                 logger.warning(f"Knowledge Base retrieval failed: {str(e)}")
         
-        # Generate test plan using Claude
-        try:
-            test_cases = generate_test_cases_with_claude(
-                plan_config, 
-                context_results, 
-                user_instructions
-            )
-            
-            # Calculate coverage metrics
-            coverage_metrics = calculate_coverage_metrics(test_cases, plan_config)
-            
-            # Create test plan
-            test_plan = {
-                'id': f"plan_{session_id}",
-                'configuration': plan_config,
-                'test_cases': test_cases,
-                'coverage_metrics': coverage_metrics,
-                'created_at': datetime.utcnow().isoformat(),
-                'updated_at': datetime.utcnow().isoformat(),
-                'status': 'draft'
-            }
-            
-            # Update session with generated plan
-            iteration_data = {
-                'iteration_number': len(session_data.get('iterations', [])) + 1,
-                'user_input': user_instructions or 'Generate initial plan',
-                'system_response': f"Generated {len(test_cases)} test cases",
-                'generated_plan': test_plan,
-                'timestamp': datetime.utcnow().isoformat()
-            }
-            
-            sessions_table.update_item(
-                Key={'id': session_id},
-                UpdateExpression='SET iterations = list_append(if_not_exists(iterations, :empty_list), :iteration), updated_at = :time',
-                ExpressionAttributeValues={
-                    ':iteration': [iteration_data],
-                    ':empty_list': [],
-                    ':time': datetime.utcnow().isoformat()
-                }
-            )
-            
-            return success_response({
-                'generated_cases': test_cases,  # ← Campo que espera el frontend
-                'test_plan': test_plan,
-                'generation_stats': {
-                    'total_test_cases': len(test_cases),
-                    'context_sources': len(context_results),
-                    'target_coverage': plan_config['coverage_percentage'],
-                    'actual_coverage': coverage_metrics['actual_coverage']
-                },
-                'session_id': session_id
-            })
-            
-        except Exception as e:
-            logger.error(f"Test plan generation failed: {str(e)}")
-            return error_response(500, 'Test plan generation failed', str(e))
+        # Generate test plan using Claude with simplified prompt
+        test_cases = generate_test_cases_with_claude(
+            plan_config, 
+            context_results, 
+            user_instructions
+        )
         
+        # Calculate coverage metrics
+        coverage_metrics = calculate_coverage_metrics(test_cases, plan_config)
+        
+        # Create test plan
+        test_plan = {
+            'id': f"plan_{session_id}",
+            'configuration': plan_config,
+            'test_cases': test_cases,
+            'coverage_metrics': coverage_metrics,
+            'created_at': datetime.utcnow().isoformat(),
+            'updated_at': datetime.utcnow().isoformat(),
+            'status': 'draft'
+        }
+        
+        # Update session with generated plan
+        iteration_data = {
+            'iteration_number': Decimal(len(session_data.get('iterations', [])) + 1),
+            'user_input': user_instructions or 'Generate initial plan',
+            'system_response': f"Generated {len(test_cases)} test cases",
+            'generated_plan': test_plan,
+            'timestamp': datetime.utcnow().isoformat()
+        }
+        
+        sessions_table.update_item(
+            Key={'id': session_id},
+            UpdateExpression='SET iterations = list_append(if_not_exists(iterations, :empty_list), :iteration), updated_at = :time',
+            ExpressionAttributeValues={
+                ':iteration': [iteration_data],
+                ':empty_list': [],
+                ':time': datetime.utcnow().isoformat()
+            }
+        )
+        
+        return success_response({
+            'generated_cases': test_cases,  # ← Campo que espera el frontend
+            'test_plan': test_plan,
+            'generation_stats': {
+                'total_test_cases': len(test_cases),
+                'context_sources': len(context_results),
+                'target_coverage': plan_config['coverage_percentage'],
+                'actual_coverage': coverage_metrics['actual_coverage']
+            },
+            'session_id': session_id
+        })
+            
     except Exception as e:
-        logger.error(f"Error: {str(e)}")
-        return error_response(500, 'Internal server error', str(e))
+        logger.error(f"Test plan generation failed: {str(e)}")
+        return error_response(500, 'Test plan generation failed', str(e))
 
 def generate_test_cases_with_claude(plan_config: Dict, context_results: List[Dict], user_instructions: str) -> List[Dict]:
-    """Generate test cases using Claude with RAG context"""
+    """Generate test cases using Claude with optimized system/user prompt structure"""
     
-    # Build context from Knowledge Base results
+    # Log the model ID being used for debugging
+    logger.info(f"Using model ID: {model_id}")
+    logger.info(f"BEDROCK_MODEL_ID env var: {os.environ.get('BEDROCK_MODEL_ID', 'NOT_SET')}")
+    
+    # Build context from Knowledge Base results (reduced to 3 contexts, 300 chars each)
     context_text = "\n\n".join([
-        f"Context {i+1}: {result['content'][:500]}..."
-        for i, result in enumerate(context_results[:5])
+        f"{result['content'][:300]}..."
+        for i, result in enumerate(context_results[:3])
     ])
     
-    # Build prompt for Claude
-    prompt = f"""
-Eres un experto en testing de software. Genera casos de prueba detallados basándote en la siguiente información:
+    # Prompts ultra-optimizados para máxima velocidad
+    system_prompt = "Genera casos de prueba en formato JSON. Devuelve únicamente JSON válido sin explicaciones."
+    
+    # Prompt conciso del usuario con información esencial únicamente
+    user_prompt = f"""Genera 8 casos de prueba para testing {plan_config['plan_type']}:
 
-CONFIGURACIÓN DEL PLAN:
-- Título: {plan_config['plan_title']}
-- Tipo: {plan_config['plan_type']}
-- Cobertura objetivo: {plan_config['coverage_percentage']}%
-- Contexto del proyecto: {plan_config['project_context']}
+REQUERIMIENTO:
+{user_instructions if user_instructions else plan_config['project_context']}
 
-CONTEXTO DE LA APLICACIÓN:
-{context_text}
-
-INSTRUCCIONES ADICIONALES:
-{user_instructions if user_instructions else "Generar casos de prueba estándar"}
-
-INSTRUCCIONES:
-1. Genera entre 5 y 15 casos de prueba según el tipo y cobertura solicitada
-2. Cada caso debe incluir todos los campos requeridos
-3. Prioriza casos críticos y de alto impacto
-4. Asegúrate de cubrir diferentes escenarios (positivos, negativos, edge cases)
-
-FORMATO DE SALIDA (JSON):
+Devuelve JSON:
 {{
   "test_cases": [
     {{
-      "testcase_number": 1,
-      "test_case_name": "Nombre descriptivo del caso",
-      "test_case_description": "Descripción detallada",
-      "preconditions": "Condiciones previas necesarias",
-      "test_data": "Datos de prueba específicos",
-      "test_steps": ["Paso 1", "Paso 2", "Paso 3"],
+      "testcase_number": "TC_001",
+      "test_case_name": "Título breve",
+      "test_case_description": "Descripción breve",
+      "preconditions": "Precondiciones",
+      "test_steps": "Pasos a ejecutar",
       "expected_results": "Resultados esperados",
-      "requirements": "Requerimientos cubiertos",
-      "priority": "ALTA|MEDIA|BAJA",
-      "status": "PROPOSED",
-      "created_by": "AI_AGENT"
+      "priority": "HIGH|MEDIUM|LOW"
     }}
   ]
-}}
-"""
+}}"""
     
     try:
-        # Call Claude
+        # Call Claude with system/user message structure
         response = bedrock_runtime.invoke_model(
             modelId=model_id,
             body=json.dumps({
                 "anthropic_version": "bedrock-2023-05-31",
-                "max_tokens": 4000,
+                "max_tokens": 3000,  # Reduced from 4000
                 "temperature": 0.1,
-                "messages": [{"role": "user", "content": prompt}]
+                "system": system_prompt,
+                "messages": [{"role": "user", "content": user_prompt}]
             })
         )
         
@@ -290,7 +298,7 @@ def calculate_coverage_metrics(test_cases: List[Dict], plan_config: Dict) -> Dic
     
     return {
         'target_coverage': target_coverage,
-        'actual_coverage': round(actual_coverage, 2),
+        'actual_coverage': Decimal(str(round(actual_coverage, 2))),
         'total_requirements': 10,  # This would come from requirements analysis
         'covered_requirements': total_cases,
         'uncovered_requirements': []
@@ -300,7 +308,7 @@ def success_response(data):
     return {
         'statusCode': 200,
         'headers': cors_headers(),
-        'body': json.dumps({**data, 'timestamp': datetime.utcnow().isoformat()})
+        'body': json.dumps({**data, 'timestamp': datetime.utcnow().isoformat()}, default=decimal_default)
     }
 
 def error_response(status_code, message, details=None):
@@ -311,7 +319,7 @@ def error_response(status_code, message, details=None):
             'error': message,
             'details': details,
             'timestamp': datetime.utcnow().isoformat()
-        })
+        }, default=decimal_default)
     }
 
 def cors_response():

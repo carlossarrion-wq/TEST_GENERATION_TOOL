@@ -4,6 +4,7 @@ import boto3
 from datetime import datetime
 from typing import Dict, Any, List
 import os
+from decimal import Decimal
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -11,13 +12,38 @@ logger.setLevel(logging.INFO)
 dynamodb = boto3.resource('dynamodb')
 sessions_table = dynamodb.Table(os.environ.get('SESSIONS_TABLE', 'test-plan-sessions'))
 
+def decimal_default(obj):
+    """Helper function to convert Decimal objects to float for JSON serialization"""
+    if isinstance(obj, Decimal):
+        return float(obj)
+    raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
+
 def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
     """POST /calculate-coverage - Calcular métricas de cobertura para un plan de pruebas"""
     try:
         if event.get('httpMethod') == 'OPTIONS':
             return cors_response()
         
-        body = json.loads(event['body']) if isinstance(event['body'], str) else event['body']
+        # Manejo robusto del body - soporta API Gateway y invocación directa
+        try:
+            if 'body' in event:
+                # Formato API Gateway
+                if event['body'] is None:
+                    return error_response(400, 'Request body is null')
+                
+                if isinstance(event['body'], str):
+                    body = json.loads(event['body'])
+                else:
+                    body = event['body']
+            else:
+                # Invocación directa - el evento ES el body
+                body = event
+                logger.info("Direct invocation detected, using event as body")
+                
+        except json.JSONDecodeError as e:
+            return error_response(400, f'Invalid JSON in request body: {str(e)}')
+        except Exception as e:
+            return error_response(400, f'Error parsing request body: {str(e)}')
         
         required_fields = ['session_id']
         missing_fields = [field for field in required_fields if field not in body]
@@ -175,19 +201,19 @@ def calculate_detailed_coverage(session_data: Dict[str, Any]) -> Dict[str, Any]:
             'total_requirements': len(all_requirements),
             'covered_requirements': len(covered_requirements),
             'uncovered_requirements': len(uncovered_requirements),
-            'target_coverage_percentage': target_coverage,
-            'actual_coverage_percentage': round(actual_coverage, 2),
-            'coverage_gap': round(coverage_gap, 2),
+            'target_coverage_percentage': Decimal(str(target_coverage)),
+            'actual_coverage_percentage': Decimal(str(round(actual_coverage, 2))),
+            'coverage_gap': Decimal(str(round(coverage_gap, 2))),
             'total_estimated_time_minutes': total_estimated_time,
-            'total_estimated_time_hours': round(total_estimated_time / 60, 2)
+            'total_estimated_time_hours': Decimal(str(round(total_estimated_time / 60, 2)))
         },
         'priority_analysis': {
             'distribution': cases_by_priority,
-            'percentages': {k: round(v, 2) for k, v in priority_percentages.items()}
+            'percentages': {k: Decimal(str(round(v, 2))) for k, v in priority_percentages.items()}
         },
         'category_analysis': {
             'distribution': cases_by_category,
-            'percentages': {k: round(v, 2) for k, v in category_percentages.items()}
+            'percentages': {k: Decimal(str(round(v, 2))) for k, v in category_percentages.items()}
         },
         'requirements_detail': list(requirements_coverage_detail.values()),
         'uncovered_requirements': uncovered_requirements,
@@ -235,7 +261,7 @@ def success_response(data):
     return {
         'statusCode': 200,
         'headers': cors_headers(),
-        'body': json.dumps({**data, 'timestamp': datetime.utcnow().isoformat()})
+        'body': json.dumps({**data, 'timestamp': datetime.utcnow().isoformat()}, default=decimal_default)
     }
 
 def error_response(status_code, message, details=None):
@@ -246,7 +272,7 @@ def error_response(status_code, message, details=None):
             'error': message,
             'details': details,
             'timestamp': datetime.utcnow().isoformat()
-        })
+        }, default=decimal_default)
     }
 
 def cors_response():

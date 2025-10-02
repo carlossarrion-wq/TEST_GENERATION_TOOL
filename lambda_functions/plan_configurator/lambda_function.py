@@ -14,13 +14,19 @@ sessions_table = dynamodb.Table(os.environ.get('SESSIONS_TABLE', 'test-plan-sess
 
 def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
     """POST /configure-plan - Configurar un nuevo plan de pruebas"""
+    logger.info("=== PLAN_CONFIGURATOR STARTED ===")
+    logger.info(f"Raw event received: {json.dumps(event, default=str)}")
+    
     try:
         if event.get('httpMethod') == 'OPTIONS':
+            logger.info("OPTIONS request detected, returning CORS response")
             return cors_response()
+        
+        logger.info("Processing POST request")
         
         # Manejo robusto del body - soporta API Gateway y invocación directa
         try:
-            logger.info(f"Lambda invoked with event: {json.dumps(event, default=str)}")
+            logger.info("Starting body parsing...")
             
             if 'body' in event:
                 # Formato API Gateway
@@ -58,6 +64,8 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
         session_id = str(uuid.uuid4())
         current_time = datetime.utcnow().isoformat()
         
+        logger.info(f"Creating new session with ID: {session_id}")
+        
         plan_configuration = {
             'plan_title': body['plan_title'],
             'plan_type': body['plan_type'],
@@ -76,7 +84,14 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
             'updated_at': current_time
         }
         
-        sessions_table.put_item(Item=session_data)
+        logger.info(f"Session data to be saved: {json.dumps(session_data, default=str)}")
+        
+        try:
+            sessions_table.put_item(Item=session_data)
+            logger.info(f"Session {session_id} saved successfully to DynamoDB")
+        except Exception as put_error:
+            logger.error(f"Error saving session to DynamoDB: {str(put_error)}")
+            raise put_error
         
         return success_response({
             'session_id': session_id,

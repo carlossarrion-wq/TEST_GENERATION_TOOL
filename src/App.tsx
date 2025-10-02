@@ -110,7 +110,33 @@ const App: React.FC = () => {
         throw new Error(`Error ${response.status}: ${response.statusText}`);
       }
 
-      const data = await response.json();
+      const rawData = await response.json();
+      logger.info('Respuesta raw de plan_configurator:', rawData);
+      
+      // Manejar respuesta de invocación directa vs API Gateway
+      let data;
+      if (rawData.body && typeof rawData.body === 'string') {
+        // Respuesta de invocación directa - el body está como string JSON
+        logger.info('Detectada respuesta de invocación directa, parseando body...');
+        data = JSON.parse(rawData.body);
+      } else if (rawData.session_id) {
+        // Respuesta directa de API Gateway
+        logger.info('Detectada respuesta directa de API Gateway');
+        data = rawData;
+      } else {
+        // Formato desconocido
+        logger.error('Formato de respuesta desconocido:', rawData);
+        throw new Error(`Formato de respuesta desconocido: ${JSON.stringify(rawData)}`);
+      }
+      
+      logger.info('Data procesada:', data);
+      logger.info('session_id en data:', data.session_id);
+      
+      // Verificar que tenemos session_id
+      if (!data.session_id) {
+        logger.error('session_id faltante. Data procesada:', JSON.stringify(data, null, 2));
+        throw new Error(`No se recibió session_id del servidor. Data: ${JSON.stringify(data)}`);
+      }
       
       // Crear sesión local
       const newSession: Session = {
@@ -124,9 +150,14 @@ const App: React.FC = () => {
         updated_at: new Date().toISOString(),
       };
 
+      logger.info('Creando sesión local:', newSession);
       setCurrentSession(newSession);
       setPlanConfig(formData);
-      nextStep();
+      
+      // Pequeño delay para asegurar consistencia de DynamoDB
+      setTimeout(() => {
+        nextStep();
+      }, 1000);
       
       logger.info('Plan configurado exitosamente', data);
     } catch (err) {
@@ -140,7 +171,12 @@ const App: React.FC = () => {
 
   // Función para generar plan de pruebas
   const handleGeneratePlan = async () => {
+    logger.info('=== HANDLE_GENERATE_PLAN STARTED ===');
+    logger.info('Estado de currentSession:', currentSession);
+    logger.info('Estado de planConfig:', planConfig);
+    
     if (!currentSession) {
+      logger.error('currentSession es null - no hay sesión activa');
       setError('No hay sesión activa');
       return;
     }
@@ -153,6 +189,13 @@ const App: React.FC = () => {
         url: `${appConfig.api.gatewayUrl}/generate-plan`,
         sessionId: currentSession.id
       });
+      
+      const requestBody = {
+        session_id: currentSession.id,
+        generation_prompt: `Generar plan de pruebas para: ${planConfig?.project_context}`,
+      };
+      
+      logger.info('Request body que se enviará:', requestBody);
 
       const response = await fetch(`${appConfig.api.gatewayUrl}/generate-plan`, {
         method: 'POST',
@@ -322,8 +365,13 @@ ${errorMessage}`;
 
   // Función para calcular cobertura
   const handleCalculateCoverage = async () => {
+    logger.info('=== HANDLE_CALCULATE_COVERAGE STARTED ===');
+    logger.info('Estado de currentSession:', currentSession);
+    logger.info('Estado de testPlan:', testPlan);
+    
     if (!currentSession) {
-      setError('No hay sesión activa');
+      logger.error('currentSession es null - no hay sesión activa');
+      setError('No hay sesión activa para calcular cobertura');
       return;
     }
 
@@ -331,6 +379,11 @@ ${errorMessage}`;
     setError(null);
 
     try {
+      logger.info('Iniciando cálculo de cobertura...', {
+        url: `${appConfig.api.gatewayUrl}/calculate-coverage`,
+        sessionId: currentSession.id
+      });
+
       const response = await fetch(`${appConfig.api.gatewayUrl}/calculate-coverage`, {
         method: 'POST',
         headers: {
@@ -342,17 +395,35 @@ ${errorMessage}`;
         }),
       });
 
+      logger.info('Respuesta recibida:', { status: response.status, statusText: response.statusText });
+
       if (!response.ok) {
         throw new Error(`Error ${response.status}: ${response.statusText}`);
       }
 
-      const data = await response.json();
+      const rawData = await response.json();
+      logger.info('Datos de cobertura recibidos:', rawData);
+      
+      // Manejar respuesta de API Gateway - parsear el body si es string
+      let data;
+      if (rawData.body && typeof rawData.body === 'string') {
+        logger.info('Parseando body de API Gateway...');
+        data = JSON.parse(rawData.body);
+      } else {
+        data = rawData;
+      }
+      
+      logger.info('Datos parseados:', data);
       
       if (testPlan && data.coverage_metrics) {
-        setTestPlan({
+        const updatedPlan = {
           ...testPlan,
-          coverage_metrics: data.coverage_metrics.summary,
-        });
+          coverage_metrics: data.coverage_metrics.summary || data.coverage_metrics,
+        };
+        logger.info('Actualizando testPlan con métricas:', updatedPlan);
+        setTestPlan(updatedPlan);
+      } else {
+        logger.warn('No se pudo actualizar testPlan:', { testPlan: !!testPlan, coverage_metrics: !!data.coverage_metrics });
       }
       
       logger.info('Cobertura calculada exitosamente', data);
