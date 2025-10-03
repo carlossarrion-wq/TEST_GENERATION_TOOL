@@ -17,7 +17,26 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
         if event.get('httpMethod') == 'OPTIONS':
             return cors_response()
         
-        body = json.loads(event['body']) if isinstance(event['body'], str) else event['body']
+        # Manejo robusto del body - soporta API Gateway y invocación directa
+        try:
+            if 'body' in event:
+                # Formato API Gateway
+                if event['body'] is None:
+                    return error_response(400, 'Request body is null')
+                
+                if isinstance(event['body'], str):
+                    body = json.loads(event['body'])
+                else:
+                    body = event['body']
+            else:
+                # Invocación directa - el evento ES el body
+                body = event
+                logger.info("Direct invocation detected, using event as body")
+                
+        except json.JSONDecodeError as e:
+            return error_response(400, f'Invalid JSON in request body: {str(e)}')
+        except Exception as e:
+            return error_response(400, f'Error parsing request body: {str(e)}')
         
         required_fields = ['query']
         missing_fields = [field for field in required_fields if field not in body]
@@ -81,11 +100,15 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
             
             logger.info(f"Retrieved {len(retrieval_results)} results from Knowledge Base")
             
+            # Generar respuesta conversacional basada en los resultados
+            conversational_response = generate_conversational_response(query, retrieval_results, body)
+            
             return success_response({
                 'query': query,
                 'knowledge_base_id': kb_id,
                 'results_count': len(retrieval_results),
                 'retrieval_results': retrieval_results,
+                'response': conversational_response,
                 'search_type': 'hybrid'
             })
             
@@ -116,6 +139,71 @@ def extract_key_concepts(results: List[Dict]) -> List[str]:
                 concepts.add(keyword)
     
     return list(concepts)
+
+def generate_conversational_response(query: str, retrieval_results: List[Dict], body: Dict) -> str:
+    """Generar respuesta conversacional basada en los resultados de búsqueda"""
+    
+    if not retrieval_results:
+        return "Lo siento, no encontré información relevante en la Knowledge Base para responder tu consulta."
+    
+    # Obtener los mejores resultados (score > 0.3)
+    relevant_results = [r for r in retrieval_results if r.get('score', 0) > 0.3]
+    
+    if not relevant_results:
+        return "Encontré algunos resultados, pero no parecen muy relevantes para tu consulta. ¿Podrías reformular tu pregunta?"
+    
+    # Tomar los 3 mejores resultados para generar la respuesta
+    top_results = relevant_results[:3]
+    
+    # Construir respuesta conversacional
+    response_parts = []
+    
+    # Introducción contextual
+    if 'caso de prueba' in query.lower() or 'test case' in query.lower():
+        response_parts.append("Basándome en las mejores prácticas de testing, te puedo explicar:")
+    elif 'prueba unitaria' in query.lower() or 'unit test' in query.lower():
+        response_parts.append("Según la documentación de pruebas unitarias:")
+    elif 'cobertura' in query.lower() or 'coverage' in query.lower():
+        response_parts.append("Respecto a la cobertura de pruebas:")
+    else:
+        response_parts.append("Basándome en la información disponible:")
+    
+    # Agregar contenido de los resultados más relevantes
+    for i, result in enumerate(top_results):
+        content = result.get('content', '').strip()
+        if content:
+            # Limpiar y formatear el contenido
+            content = content.replace('\\u00a0', ' ')  # Reemplazar espacios no-break
+            content = content.replace('\\u00bf', '¿')  # Reemplazar caracteres especiales
+            content = content.replace('\\u00f3', 'ó')
+            content = content.replace('\\u00e9', 'é')
+            content = content.replace('\\u00ed', 'í')
+            content = content.replace('\\u00f1', 'ñ')
+            content = content.replace('\\u00e1', 'á')
+            content = content.replace('\\u00fa', 'ú')
+            
+            # Tomar las primeras 2-3 oraciones más relevantes
+            sentences = content.split('.')[:3]
+            clean_content = '. '.join(sentences).strip()
+            
+            if clean_content:
+                response_parts.append(f"\n\n**Punto {i+1}:** {clean_content}")
+    
+    # Agregar información del contexto del plan si está disponible
+    current_plan = body.get('current_plan')
+    if current_plan and current_plan.get('test_cases'):
+        test_cases_count = len(current_plan['test_cases'])
+        response_parts.append(f"\n\n💡 **Contexto de tu plan:** Tienes {test_cases_count} casos de prueba generados. ¿Te gustaría que analice alguno específico o que sugiera mejoras?")
+    
+    # Agregar sugerencias de seguimiento
+    if 'ejemplo' in query.lower() or 'example' in query.lower():
+        response_parts.append("\n\n¿Te gustaría que te muestre cómo aplicar esto a tu plan específico?")
+    elif 'modificar' in query.lower() or 'cambiar' in query.lower():
+        response_parts.append("\n\n¿Qué aspectos específicos te gustaría modificar en tu plan?")
+    else:
+        response_parts.append("\n\n¿Hay algo más específico sobre este tema que te gustaría saber?")
+    
+    return ''.join(response_parts)
 
 def success_response(data):
     return {
