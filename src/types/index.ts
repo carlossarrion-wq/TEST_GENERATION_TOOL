@@ -168,9 +168,26 @@ export interface KBQueryRequest {
 
 // Mensaje de conversación
 export interface ConversationMessage {
-  role: 'user' | 'assistant';
+  role: 'user' | 'assistant' | 'system';
   content: string;
   timestamp: string;
+  isTyping?: boolean;
+}
+
+// Chat con Knowledge Base
+export interface ChatSession {
+  id: string;
+  messages: ConversationMessage[];
+  isActive: boolean;
+  created_at: string;
+}
+
+// Respuesta del chat con KB
+export interface ChatResponse {
+  response: string;
+  processing_time_ms: number;
+  model_used: string;
+  knowledge_base_id: string;
 }
 
 // Error de API

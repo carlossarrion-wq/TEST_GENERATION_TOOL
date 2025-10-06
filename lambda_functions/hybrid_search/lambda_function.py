@@ -141,69 +141,106 @@ def extract_key_concepts(results: List[Dict]) -> List[str]:
     return list(concepts)
 
 def generate_conversational_response(query: str, retrieval_results: List[Dict], body: Dict) -> str:
-    """Generar respuesta conversacional basada en los resultados de búsqueda"""
+    """Generar respuesta conversacional usando Claude Sonnet 4 con historial"""
     
-    if not retrieval_results:
-        return "Lo siento, no encontré información relevante en la Knowledge Base para responder tu consulta."
+    logger.info(f"=== GENERATE_CONVERSATIONAL_RESPONSE CALLED ===")
+    logger.info(f"Query received: {query}")
+    logger.info(f"Session ID: {body.get('session_id')}")
+    logger.info(f"Plan context available: {bool(body.get('plan_context'))}")
+    logger.info(f"Conversation history length: {len(body.get('conversation_history', []))}")
     
-    # Obtener los mejores resultados (score > 0.3)
-    relevant_results = [r for r in retrieval_results if r.get('score', 0) > 0.3]
+    # Preparar contexto del plan con casos de prueba completos
+    plan_info = body.get('plan_context')
+    context_text = ""
     
-    if not relevant_results:
-        return "Encontré algunos resultados, pero no parecen muy relevantes para tu consulta. ¿Podrías reformular tu pregunta?"
+    if plan_info:
+        context_text = f"El usuario tiene un plan de pruebas llamado '{plan_info.get('plan_title', 'Sin título')}' de tipo {plan_info.get('plan_type', 'No especificado')} con {plan_info.get('test_cases_count', 0)} casos de prueba generados."
+        
+        # Agregar información detallada de los casos de prueba
+        test_cases = plan_info.get('test_cases', [])
+        if test_cases:
+            context_text += "\n\nCasos de prueba del plan:\n"
+            for case in test_cases:
+                context_text += f"""
+Caso {case.get('number', 'N/A')}: {case.get('name', 'Sin nombre')}
+- Descripción: {case.get('description', 'Sin descripción')}
+- Prioridad: {case.get('priority', 'No especificada')}
+- Precondiciones: {case.get('preconditions', 'N/A')}
+- Pasos: {case.get('test_steps', 'N/A')}
+- Resultados esperados: {case.get('expected_results', 'N/A')}
+- Datos de prueba: {case.get('test_data', 'N/A')}
+- Requisitos: {case.get('requirements', 'N/A')}
+"""
     
-    # Tomar los 3 mejores resultados para generar la respuesta
-    top_results = relevant_results[:3]
-    
-    # Construir respuesta conversacional
-    response_parts = []
-    
-    # Introducción contextual
-    if 'caso de prueba' in query.lower() or 'test case' in query.lower():
-        response_parts.append("Basándome en las mejores prácticas de testing, te puedo explicar:")
-    elif 'prueba unitaria' in query.lower() or 'unit test' in query.lower():
-        response_parts.append("Según la documentación de pruebas unitarias:")
-    elif 'cobertura' in query.lower() or 'coverage' in query.lower():
-        response_parts.append("Respecto a la cobertura de pruebas:")
-    else:
-        response_parts.append("Basándome en la información disponible:")
-    
-    # Agregar contenido de los resultados más relevantes
-    for i, result in enumerate(top_results):
-        content = result.get('content', '').strip()
-        if content:
-            # Limpiar y formatear el contenido
-            content = content.replace('\\u00a0', ' ')  # Reemplazar espacios no-break
-            content = content.replace('\\u00bf', '¿')  # Reemplazar caracteres especiales
-            content = content.replace('\\u00f3', 'ó')
-            content = content.replace('\\u00e9', 'é')
-            content = content.replace('\\u00ed', 'í')
-            content = content.replace('\\u00f1', 'ñ')
-            content = content.replace('\\u00e1', 'á')
-            content = content.replace('\\u00fa', 'ú')
-            
-            # Tomar las primeras 2-3 oraciones más relevantes
-            sentences = content.split('.')[:3]
-            clean_content = '. '.join(sentences).strip()
-            
-            if clean_content:
-                response_parts.append(f"\n\n**Punto {i+1}:** {clean_content}")
-    
-    # Agregar información del contexto del plan si está disponible
-    current_plan = body.get('current_plan')
-    if current_plan and current_plan.get('test_cases'):
-        test_cases_count = len(current_plan['test_cases'])
-        response_parts.append(f"\n\n💡 **Contexto de tu plan:** Tienes {test_cases_count} casos de prueba generados. ¿Te gustaría que analice alguno específico o que sugiera mejoras?")
-    
-    # Agregar sugerencias de seguimiento
-    if 'ejemplo' in query.lower() or 'example' in query.lower():
-        response_parts.append("\n\n¿Te gustaría que te muestre cómo aplicar esto a tu plan específico?")
-    elif 'modificar' in query.lower() or 'cambiar' in query.lower():
-        response_parts.append("\n\n¿Qué aspectos específicos te gustaría modificar en tu plan?")
-    else:
-        response_parts.append("\n\n¿Hay algo más específico sobre este tema que te gustaría saber?")
-    
-    return ''.join(response_parts)
+    # Intentar llamar a Claude con historial conversacional
+    try:
+        bedrock_runtime = boto3.client('bedrock-runtime')
+        model_id = os.environ.get('BEDROCK_MODEL_ID', 'arn:aws:bedrock:eu-west-1:701055077130:inference-profile/eu.anthropic.claude-sonnet-4-20250514-v1:0')
+        
+        logger.info(f"Attempting Claude call with model: {model_id}")
+        
+        # Preparar mensajes con historial conversacional
+        messages = []
+        
+        # Agregar historial de conversación si existe
+        conversation_history = body.get('conversation_history', [])
+        for msg in conversation_history:
+            if msg.get('role') in ['user', 'assistant']:
+                messages.append({
+                    "role": msg['role'],
+                    "content": msg['content']
+                })
+        
+        # Agregar el mensaje actual del usuario
+        messages.append({
+            "role": "user",
+            "content": query
+        })
+        
+        # System prompt con contexto
+        system_prompt = f"""Eres un experto en testing de software y planes de prueba. Mantén una conversación natural y útil.
+
+{context_text}
+
+Características:
+- Conversacional y amigable, pero profesional
+- Recuerda el contexto de la conversación anterior
+- Proporciona consejos específicos sobre testing
+- Sugiere mejoras cuando sea apropiado"""
+        
+        logger.info(f"Sending {len(messages)} messages to Claude")
+        
+        response = bedrock_runtime.invoke_model(
+            modelId=model_id,
+            body=json.dumps({
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": 800,
+                "system": system_prompt,
+                "messages": messages,
+                "temperature": 0.5
+            })
+        )
+        
+        response_body = json.loads(response['body'].read())
+        claude_response = response_body['content'][0]['text']
+        
+        logger.info(f"Claude response successful: {len(claude_response)} chars")
+        return claude_response.strip()
+        
+    except Exception as e:
+        logger.error(f"Claude call failed: {type(e).__name__}: {str(e)}")
+        
+        # Fallback funcional (sabemos que funciona)
+        if "hola" in query.lower():
+            if plan_info:
+                return f"¡Hola! Veo que estás trabajando en el plan '{plan_info.get('plan_title', 'Sin título')}' con {plan_info.get('test_cases_count', 0)} casos de prueba de tipo {plan_info.get('plan_type', 'No especificado')}. ¿En qué puedo ayudarte?"
+            else:
+                return "¡Hola! Soy tu asistente especializado en testing. ¿En qué puedo ayudarte?"
+        
+        if plan_info:
+            return f"Entiendo tu consulta sobre '{query}'. Basándome en tu plan '{plan_info.get('plan_title', 'Sin título')}' con {plan_info.get('test_cases_count', 0)} casos de tipo {plan_info.get('plan_type', 'No especificado')}, puedo ayudarte con análisis y mejoras. ¿Qué aspecto específico te interesa?"
+        
+        return f"He recibido tu consulta: '{query}'. Como experto en testing, puedo ayudarte con planes de prueba, casos de prueba y mejores prácticas. ¿Podrías ser más específico?"
 
 def success_response(data):
     return {
