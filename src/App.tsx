@@ -9,6 +9,8 @@ const logger = createLogger('App');
 const App: React.FC = () => {
   // Estados principales
   const [currentStep, setCurrentStep] = useState(0);
+  const [showPreviewModal, setShowPreviewModal] = useState(false);
+  const [exportLoading, setExportLoading] = useState(false);
   const [isConfigValid, setIsConfigValid] = useState(false);
   const [currentSession, setCurrentSession] = useState<Session | null>(null);
   const [planConfig, setPlanConfig] = useState<PlanConfiguration | null>(null);
@@ -23,6 +25,8 @@ const App: React.FC = () => {
     plan_title: '',
     plan_type: 'UNITARIAS' as PlanType,
     coverage_percentage: 80,
+    min_test_cases: 5,
+    max_test_cases: 15,
     project_context: '',
   });
 
@@ -71,7 +75,7 @@ const App: React.FC = () => {
 
   // Navegación entre pasos
   const nextStep = () => {
-    if (currentStep < 4) {
+    if (currentStep < 3) {
       setCurrentStep(currentStep + 1);
     }
   };
@@ -110,6 +114,8 @@ const App: React.FC = () => {
           plan_title: formData.plan_title,
           plan_type: formData.plan_type,
           coverage_percentage: formData.coverage_percentage,
+          min_test_cases: formData.min_test_cases,
+          max_test_cases: formData.max_test_cases,
           project_context: formData.project_context,
         }),
       });
@@ -213,7 +219,16 @@ const App: React.FC = () => {
         },
         body: JSON.stringify({
           session_id: currentSession.id,
-          generation_prompt: `Generar plan de pruebas para: ${planConfig?.project_context}`,
+          generation_prompt: `Generar plan de pruebas para: ${planConfig?.project_context}
+
+ESPECIFICACIONES DEL PLAN:
+- Tipo de pruebas: ${planConfig?.plan_type}
+- Cobertura objetivo: ${planConfig?.coverage_percentage}%
+- Número de casos de prueba: Entre ${planConfig?.min_test_cases} y ${planConfig?.max_test_cases} casos
+- Título del plan: ${planConfig?.plan_title}
+
+INSTRUCCIONES:
+Genera entre ${planConfig?.min_test_cases} y ${planConfig?.max_test_cases} casos de prueba de tipo ${planConfig?.plan_type} que cubran el ${planConfig?.coverage_percentage}% del proyecto descrito. Ajusta la cantidad de casos según la complejidad del contexto proporcionado, pero respeta siempre el rango especificado.`,
         }),
       });
 
@@ -368,6 +383,145 @@ ${errorMessage}`;
       logger.error('Error crítico al conectar con Knowledge Base:', err);
     } finally {
       setLoading(false);
+    }
+  };
+
+  // Función para generar JSON localmente
+  const generateJSONContent = (testPlan: TestPlan, planConfig: PlanConfiguration) => {
+    const exportData = {
+      plan_configuration: planConfig,
+      test_plan: testPlan,
+      exported_at: new Date().toISOString(),
+      format: 'json'
+    };
+    return JSON.stringify(exportData, null, 2);
+  };
+
+  // Función para generar CSV compatible con Excel
+  const generateExcelCSVContent = (testPlan: TestPlan, planConfig: PlanConfiguration) => {
+    // Información del plan
+    const planInfo = [
+      ['PLAN DE PRUEBAS'],
+      [''],
+      ['Título:', planConfig.plan_title],
+      ['Tipo:', planConfig.plan_type],
+      ['Cobertura objetivo:', `${planConfig.coverage_percentage}%`],
+      ['Total de casos:', testPlan.test_cases.length.toString()],
+      ['Fecha de generación:', new Date().toLocaleDateString()],
+      [''],
+      ['CASOS DE PRUEBA'],
+      ['']
+    ];
+
+    // Headers de la tabla
+    const headers = [
+      '#',
+      'Nombre del Caso',
+      'Descripción',
+      'Precondiciones',
+      'Pasos de Prueba',
+      'Resultados Esperados',
+      'Prioridad',
+      'Estado'
+    ];
+
+    // Casos de prueba
+    const testCaseRows = testPlan.test_cases.map((testCase, index) => {
+      const steps = Array.isArray(testCase.test_steps) 
+        ? testCase.test_steps.join('; ') 
+        : testCase.test_steps || '';
+
+      return [
+        (index + 1).toString(),
+        testCase.test_case_name || '',
+        testCase.test_case_description || '',
+        testCase.preconditions || '',
+        steps,
+        testCase.expected_results || '',
+        testCase.priority || 'MEDIA',
+        testCase.status || 'PROPOSED'
+      ];
+    });
+
+    // Combinar todo
+    const allRows = [
+      ...planInfo,
+      headers,
+      ...testCaseRows
+    ];
+
+    // Convertir a CSV con escape de comillas
+    const csvContent = allRows.map(row => 
+      row.map(cell => {
+        // Escapar comillas dobles y envolver en comillas si contiene comas, saltos de línea o comillas
+        const cellStr = cell.toString();
+        if (cellStr.includes(',') || cellStr.includes('\n') || cellStr.includes('"')) {
+          return `"${cellStr.replace(/"/g, '""')}"`;
+        }
+        return cellStr;
+      }).join(',')
+    ).join('\n');
+
+    return csvContent;
+  };
+
+  // Función para descargar Excel (CSV)
+  const handleDownloadExcel = async () => {
+    if (!testPlan || !planConfig) return;
+
+    setExportLoading(true);
+    try {
+      const content = generateExcelCSVContent(testPlan, planConfig);
+      const fileName = `plan_${planConfig.plan_title?.replace(/[^a-zA-Z0-9]/g, '_') || 'pruebas'}_${new Date().toISOString().split('T')[0]}.csv`;
+      
+      // Añadir BOM para que Excel reconozca correctamente los caracteres UTF-8
+      const BOM = '\uFEFF';
+      const blob = new Blob([BOM + content], { type: 'text/csv;charset=utf-8;' });
+      const url = window.URL.createObjectURL(blob);
+      
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = fileName;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      window.URL.revokeObjectURL(url);
+      
+      logger.info('Excel CSV descargado exitosamente', { fileName });
+      setShowPreviewModal(false);
+    } catch (err) {
+      logger.error('Error al descargar Excel CSV:', err);
+    } finally {
+      setExportLoading(false);
+    }
+  };
+
+  // Función para descargar JSON
+  const handleDownloadJSON = async () => {
+    if (!testPlan || !planConfig) return;
+
+    setExportLoading(true);
+    try {
+      const content = generateJSONContent(testPlan, planConfig);
+      const fileName = `plan_${planConfig.plan_title?.replace(/[^a-zA-Z0-9]/g, '_') || 'pruebas'}_${new Date().toISOString().split('T')[0]}.json`;
+      
+      const blob = new Blob([content], { type: 'application/json;charset=utf-8;' });
+      const url = window.URL.createObjectURL(blob);
+      
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = fileName;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      window.URL.revokeObjectURL(url);
+      
+      logger.info('JSON descargado exitosamente', { fileName });
+      setShowPreviewModal(false);
+    } catch (err) {
+      logger.error('Error al descargar JSON:', err);
+    } finally {
+      setExportLoading(false);
     }
   };
 
@@ -636,7 +790,6 @@ ${testCasesList}
     }
   };
 
-
   const handleSuggestionClick = (suggestion: string) => {
     setChatInput(suggestion);
   };
@@ -659,6 +812,80 @@ ${testCasesList}
   useEffect(() => {
     scrollToBottom();
   }, [chatMessages]);
+
+  // Renderizar modal de vista previa
+  const renderPreviewModal = () => {
+    if (!showPreviewModal || !testPlan || !planConfig) return null;
+
+    return (
+      <div className="modal-overlay" onClick={() => setShowPreviewModal(false)}>
+        <div className="modal-content" onClick={(e) => e.stopPropagation()}>
+          <div className="modal-header">
+            <h2>👁️ Vista Previa del Plan</h2>
+            <button 
+              className="modal-close"
+              onClick={() => setShowPreviewModal(false)}
+            >
+              ✕
+            </button>
+          </div>
+          
+          <div className="modal-body">
+            {/* Resumen del plan */}
+            <div className="preview-summary">
+              <h3>📋 {planConfig.plan_title}</h3>
+              <div className="preview-stats">
+                <span>📊 {testPlan.test_cases.length} casos</span>
+                <span>🎯 {planConfig.plan_type}</span>
+                <span>📈 {testPlan.coverage_metrics.target_coverage}% cobertura</span>
+              </div>
+            </div>
+
+            {/* Lista de casos de prueba */}
+            <div className="preview-cases-list">
+              <h4>Casos de Prueba:</h4>
+              <div className="cases-container">
+                {testPlan.test_cases.map((testCase, index) => (
+                  <div key={index} className="preview-case-item">
+                    <div className="case-number">TC_{String(index + 1).padStart(3, '0')}</div>
+                    <div className="case-details">
+                      <div className="case-name">{testCase.test_case_name}</div>
+                      <div className="case-description">{testCase.test_case_description}</div>
+                      <div className="case-priority">Prioridad: {testCase.priority}</div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          <div className="modal-footer">
+            <button 
+              className="btn btn-secondary"
+              onClick={() => setShowPreviewModal(false)}
+              disabled={exportLoading}
+            >
+              Cerrar
+            </button>
+            <button 
+              className="btn btn-primary"
+              onClick={handleDownloadExcel}
+              disabled={exportLoading}
+            >
+              {exportLoading ? 'Descargando...' : '📊 Descargar Excel'}
+            </button>
+            <button 
+              className="btn btn-primary"
+              onClick={handleDownloadJSON}
+              disabled={exportLoading}
+            >
+              {exportLoading ? 'Descargando...' : '🔧 Descargar JSON'}
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  };
 
   // Renderizar pantalla de bienvenida
   const renderWelcomeScreen = () => (
@@ -823,70 +1050,139 @@ ${testCasesList}
         </div>
       </div>
 
-      {/* Selector de cobertura mejorado */}
-      <div className="coverage-slider-container">
-        <div className="coverage-slider-header">
-          <div className="coverage-title">
-            📊 Porcentaje de Cobertura Objetivo
+      {/* Contenedor para cobertura y número de casos */}
+      <div className="config-row">
+        {/* Selector de cobertura mejorado */}
+        <div className="coverage-slider-container">
+          <div className="coverage-slider-header">
+            <div className="coverage-title">
+              📊 Porcentaje de Cobertura Objetivo
+            </div>
+            <div className="coverage-value">
+              {formData.coverage_percentage}%
+            </div>
           </div>
-          <div className="coverage-value">
-            {formData.coverage_percentage}%
+          <div className="coverage-slider-track">
+            <input
+              type="range"
+              min="10"
+              max="100"
+              value={formData.coverage_percentage}
+              onChange={(e) => setFormData({ ...formData, coverage_percentage: parseInt(e.target.value) })}
+              className="coverage-range"
+            />
+          </div>
+          <div className="coverage-labels" style={{ position: 'relative', marginTop: '10px', height: '40px' }}>
+            <div className="coverage-label" style={{ 
+              position: 'absolute', 
+              left: '0%', 
+              transform: 'translateX(0%)',
+              textAlign: 'center'
+            }}>
+              <span>10%</span>
+              <small style={{ display: 'block', fontSize: '11px', color: '#64748b' }}>Básico</small>
+            </div>
+            <div className="coverage-label" style={{ 
+              position: 'absolute', 
+              left: `${((50 - 10) / (100 - 10)) * 100}%`, 
+              transform: 'translateX(-50%)',
+              textAlign: 'center'
+            }}>
+              <span>50%</span>
+              <small style={{ display: 'block', fontSize: '11px', color: '#64748b' }}>Medio</small>
+            </div>
+            <div className="coverage-label" style={{ 
+              position: 'absolute', 
+              left: `${((80 - 10) / (100 - 10)) * 100}%`, 
+              transform: 'translateX(-50%)',
+              textAlign: 'center'
+            }}>
+              <span>80%</span>
+              <small style={{ display: 'block', fontSize: '11px', color: '#64748b' }}>Alto</small>
+            </div>
+            <div className="coverage-label" style={{ 
+              position: 'absolute', 
+              left: '100%', 
+              transform: 'translateX(-100%)',
+              textAlign: 'center'
+            }}>
+              <span>100%</span>
+              <small style={{ display: 'block', fontSize: '11px', color: '#64748b' }}>Completo</small>
+            </div>
+          </div>
+          <div className="coverage-description">
+            <strong>Cobertura {formData.coverage_percentage}%:</strong> 
+            {formData.coverage_percentage < 30 && ' Cobertura básica para pruebas esenciales'}
+            {formData.coverage_percentage >= 30 && formData.coverage_percentage < 60 && ' Cobertura moderada para funcionalidades principales'}
+            {formData.coverage_percentage >= 60 && formData.coverage_percentage < 85 && ' Cobertura alta para la mayoría de funcionalidades'}
+            {formData.coverage_percentage >= 85 && ' Cobertura exhaustiva para máxima calidad'}
           </div>
         </div>
-        <div className="coverage-slider-track">
-          <input
-            type="range"
-            min="10"
-            max="100"
-            value={formData.coverage_percentage}
-            onChange={(e) => setFormData({ ...formData, coverage_percentage: parseInt(e.target.value) })}
-            className="coverage-range"
-          />
-        </div>
-        <div className="coverage-labels" style={{ position: 'relative', marginTop: '10px', height: '40px' }}>
-          <div className="coverage-label" style={{ 
-            position: 'absolute', 
-            left: '0%', 
-            transform: 'translateX(0%)',
-            textAlign: 'center'
-          }}>
-            <span>10%</span>
-            <small style={{ display: 'block', fontSize: '11px', color: '#64748b' }}>Básico</small>
+
+        {/* Selector de número de casos */}
+        <div className="test-cases-selector">
+          <div className="test-cases-header">
+            <div className="test-cases-title">
+              🔢 Número de Casos de Prueba
+            </div>
           </div>
-          <div className="coverage-label" style={{ 
-            position: 'absolute', 
-            left: `${((50 - 10) / (100 - 10)) * 100}%`, 
-            transform: 'translateX(-50%)',
-            textAlign: 'center'
-          }}>
-            <span>50%</span>
-            <small style={{ display: 'block', fontSize: '11px', color: '#64748b' }}>Medio</small>
+          
+          <div className="test-cases-inputs">
+            <div className="test-case-input-group">
+              <label className="test-case-label">Mínimo</label>
+              <div className="test-case-input-container">
+                <input
+                  type="number"
+                  min="1"
+                  max="50"
+                  value={formData.min_test_cases}
+                  onChange={(e) => {
+                    const minValue = parseInt(e.target.value) || 1;
+                    const maxValue = Math.max(minValue, formData.max_test_cases);
+                    setFormData({ 
+                      ...formData, 
+                      min_test_cases: minValue,
+                      max_test_cases: maxValue
+                    });
+                  }}
+                  className="test-case-input"
+                />
+                <span className="test-case-unit">casos</span>
+              </div>
+            </div>
+            
+            <div className="test-case-separator">-</div>
+            
+            <div className="test-case-input-group">
+              <label className="test-case-label">Máximo</label>
+              <div className="test-case-input-container">
+                <input
+                  type="number"
+                  min={formData.min_test_cases}
+                  max="100"
+                  value={formData.max_test_cases}
+                  onChange={(e) => {
+                    const maxValue = parseInt(e.target.value) || formData.min_test_cases;
+                    setFormData({ 
+                      ...formData, 
+                      max_test_cases: Math.max(maxValue, formData.min_test_cases)
+                    });
+                  }}
+                  className="test-case-input"
+                />
+                <span className="test-case-unit">casos</span>
+              </div>
+            </div>
           </div>
-          <div className="coverage-label" style={{ 
-            position: 'absolute', 
-            left: `${((80 - 10) / (100 - 10)) * 100}%`, 
-            transform: 'translateX(-50%)',
-            textAlign: 'center'
-          }}>
-            <span>80%</span>
-            <small style={{ display: 'block', fontSize: '11px', color: '#64748b' }}>Alto</small>
+          
+          <div className="test-cases-description">
+            <strong>Rango: {formData.min_test_cases} - {formData.max_test_cases} casos</strong>
+            <br />
+            {formData.min_test_cases === formData.max_test_cases 
+              ? `Se generarán exactamente ${formData.min_test_cases} casos de prueba`
+              : `Se generarán entre ${formData.min_test_cases} y ${formData.max_test_cases} casos según la complejidad del proyecto`
+            }
           </div>
-          <div className="coverage-label" style={{ 
-            position: 'absolute', 
-            left: '100%', 
-            transform: 'translateX(-100%)',
-            textAlign: 'center'
-          }}>
-            <span>100%</span>
-            <small style={{ display: 'block', fontSize: '11px', color: '#64748b' }}>Completo</small>
-          </div>
-        </div>
-        <div className="coverage-description">
-          <strong>Cobertura {formData.coverage_percentage}%:</strong> 
-          {formData.coverage_percentage < 30 && ' Cobertura básica para pruebas esenciales'}
-          {formData.coverage_percentage >= 30 && formData.coverage_percentage < 60 && ' Cobertura moderada para funcionalidades principales'}
-          {formData.coverage_percentage >= 60 && formData.coverage_percentage < 85 && ' Cobertura alta para la mayoría de funcionalidades'}
-          {formData.coverage_percentage >= 85 && ' Cobertura exhaustiva para máxima calidad'}
         </div>
       </div>
 
@@ -1147,6 +1443,8 @@ ${testCasesList}
               plan_title: '',
               plan_type: 'UNITARIAS' as PlanType,
               coverage_percentage: 80,
+              min_test_cases: 5,
+              max_test_cases: 15,
               project_context: '',
             });
           }}
@@ -1168,6 +1466,14 @@ ${testCasesList}
             '📊 Calcular Cobertura'
           )}
         </button>
+        <button
+          type="button"
+          className="btn btn-primary"
+          onClick={() => setShowPreviewModal(true)}
+          disabled={!testPlan}
+        >
+          👁️ Vista Previa
+        </button>
       </div>
     </div>
   );
@@ -1186,14 +1492,13 @@ ${testCasesList}
           {/* Indicador de progreso - Solo mostrar cuando no estemos en la pantalla de bienvenida */}
           {currentStep > 0 && (
             <div className="progress-indicator">
-              {[1, 2, 3, 4].map((step) => (
+              {[1, 2, 3].map((step) => (
                 <div key={step} className={`step ${currentStep === step ? 'active' : ''} ${currentStep > step ? 'completed' : ''}`}>
                   <div className="step-number">{step}</div>
                   <div className="step-label">
                     {step === 1 && 'Configuración'}
                     {step === 2 && 'Generación'}
                     {step === 3 && 'Resultados'}
-                    {step === 4 && 'Exportar'}
                   </div>
                 </div>
               ))}
@@ -1225,6 +1530,9 @@ ${testCasesList}
           {currentStep === 2 && renderPlanGenerator()}
           {currentStep === 3 && renderResults()}
         </div>
+
+        {/* Modal de vista previa */}
+        {renderPreviewModal()}
       </div>
     </div>
   );

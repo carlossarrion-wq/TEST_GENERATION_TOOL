@@ -2,333 +2,452 @@ import json
 import logging
 import boto3
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, Any, List
 import os
-import csv
 import io
 import base64
+from decimal import Decimal
+
+# Para generar archivos Excel
+try:
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+except ImportError:
+    openpyxl = None
+
+# Para generar archivos PDF
+try:
+    from reportlab.lib.pagesizes import letter, A4
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib import colors
+    from reportlab.lib.units import inch
+except ImportError:
+    SimpleDocTemplate = None
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 dynamodb = boto3.resource('dynamodb')
 s3_client = boto3.client('s3')
+
 sessions_table = dynamodb.Table(os.environ.get('SESSIONS_TABLE', 'test-plan-sessions'))
+s3_bucket = os.environ.get('S3_BUCKET', 'test-plan-exports')
+
+def decimal_default(obj):
+    """Helper function to convert Decimal objects to float for JSON serialization"""
+    if isinstance(obj, Decimal):
+        return float(obj)
+    raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
 
 def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
-    """POST /export-plan - Exportar plan de pruebas en múltiples formatos"""
+    """POST /export-plan - Exportar plan de pruebas en diferentes formatos"""
+    logger.info("=== PLAN_EXPORTER STARTED ===")
+    logger.info(f"Raw event received: {json.dumps(event, default=str)}")
+    
     try:
         if event.get('httpMethod') == 'OPTIONS':
+            logger.info("OPTIONS request detected, returning CORS response")
             return cors_response()
         
-        body = json.loads(event['body']) if isinstance(event['body'], str) else event['body']
+        logger.info("Processing POST request")
         
-        required_fields = ['session_id', 'export_format']
+        # Manejo robusto del body - soporta API Gateway y invocación directa
+        try:
+            if 'body' in event:
+                # Formato API Gateway
+                if event['body'] is None:
+                    return error_response(400, 'Request body is null')
+                
+                if isinstance(event['body'], str):
+                    body = json.loads(event['body'])
+                else:
+                    body = event['body']
+            else:
+                # Invocación directa - el evento ES el body
+                body = event
+                logger.info("Direct invocation detected, using event as body")
+                
+        except json.JSONDecodeError as e:
+            return error_response(400, f'Invalid JSON in request body: {str(e)}')
+        except Exception as e:
+            return error_response(400, f'Error parsing request body: {str(e)}')
+        
+        required_fields = ['session_id', 'format']
         missing_fields = [field for field in required_fields if field not in body]
         
         if missing_fields:
             return error_response(400, f'Missing required fields: {", ".join(missing_fields)}')
         
         session_id = body['session_id']
-        export_format = body['export_format'].upper()
+        export_format = body['format'].lower()
+        include_metadata = body.get('include_metadata', True)
         
-        # Validar formato de exportación
-        valid_formats = ['JSON', 'CSV', 'EXCEL', 'PDF']
+        # Validar formato
+        valid_formats = ['excel', 'pdf', 'json', 'csv']
         if export_format not in valid_formats:
-            return error_response(400, f'Invalid export format. Must be one of: {", ".join(valid_formats)}')
+            return error_response(400, f'Invalid format. Must be one of: {", ".join(valid_formats)}')
         
-        # Obtener la sesión actual
+        logger.info(f"Exporting plan for session {session_id} in format {export_format}")
+        
+        # Obtener datos de la sesión
         try:
-            response = sessions_table.get_item(Key={'id': session_id})
-            if 'Item' not in response:
-                return error_response(404, 'Session not found')
+            session_response = sessions_table.get_item(Key={'id': session_id})
             
-            session_data = response['Item']
+            if 'Item' not in session_response:
+                return error_response(404, f'Session not found: {session_id}')
+            
+            session_data = session_response['Item']
+            logger.info(f"Session found: {session_data.get('id', 'unknown')}")
         except Exception as e:
             logger.error(f"Error retrieving session: {str(e)}")
             return error_response(500, 'Error retrieving session data')
         
-        # Opciones de exportación
-        export_options = {
-            'include_metrics': body.get('include_metrics', True),
-            'include_iterations': body.get('include_iterations', True),
-            'include_requirements': body.get('include_requirements', True),
-            'filter_by_priority': body.get('filter_by_priority', None),
-            'filter_by_category': body.get('filter_by_category', None),
-            'custom_fields': body.get('custom_fields', [])
-        }
+        # Extraer plan de pruebas de la última iteración
+        iterations = session_data.get('iterations', [])
+        if not iterations:
+            return error_response(400, 'No test plan found in session')
         
-        # Generar el contenido exportado según el formato
-        if export_format == 'JSON':
-            export_content, content_type = export_to_json(session_data, export_options)
-            file_extension = 'json'
-        elif export_format == 'CSV':
-            export_content, content_type = export_to_csv(session_data, export_options)
-            file_extension = 'csv'
-        elif export_format == 'EXCEL':
-            export_content, content_type = export_to_excel(session_data, export_options)
-            file_extension = 'xlsx'
-        elif export_format == 'PDF':
-            export_content, content_type = export_to_pdf(session_data, export_options)
-            file_extension = 'pdf'
+        # Obtener la última iteración con plan generado
+        latest_iteration = None
+        for iteration in reversed(iterations):
+            if iteration.get('generated_plan') and iteration['generated_plan'].get('test_cases'):
+                latest_iteration = iteration
+                break
         
-        # Generar nombre de archivo
-        plan_title = session_data.get('plan_configuration', {}).get('plan_title', 'test_plan')
-        safe_title = "".join(c for c in plan_title if c.isalnum() or c in (' ', '-', '_')).rstrip()
-        timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
-        filename = f"{safe_title}_{timestamp}.{file_extension}"
+        if not latest_iteration:
+            return error_response(400, 'No test cases found in session')
         
-        # Subir a S3 si está configurado
-        download_url = None
-        bucket_name = os.environ.get('EXPORTS_BUCKET')
+        test_plan = latest_iteration['generated_plan']
+        plan_config = session_data.get('plan_configuration', {})
         
-        if bucket_name:
-            try:
-                s3_key = f"exports/{session_id}/{filename}"
-                
-                if export_format in ['EXCEL', 'PDF']:
-                    # Para archivos binarios
-                    s3_client.put_object(
-                        Bucket=bucket_name,
-                        Key=s3_key,
-                        Body=export_content,
-                        ContentType=content_type,
-                        ContentDisposition=f'attachment; filename="{filename}"'
-                    )
-                else:
-                    # Para archivos de texto
-                    s3_client.put_object(
-                        Bucket=bucket_name,
-                        Key=s3_key,
-                        Body=export_content.encode('utf-8'),
-                        ContentType=content_type,
-                        ContentDisposition=f'attachment; filename="{filename}"'
-                    )
-                
-                # Generar URL de descarga presignada (válida por 1 hora)
-                download_url = s3_client.generate_presigned_url(
-                    'get_object',
-                    Params={'Bucket': bucket_name, 'Key': s3_key},
-                    ExpiresIn=3600
-                )
-                
-                logger.info(f"File exported to S3: {s3_key}")
-                
-            except Exception as e:
-                logger.error(f"Error uploading to S3: {str(e)}")
-                # Continuar sin S3 si hay error
+        logger.info(f"Found test plan with {len(test_plan.get('test_cases', []))} test cases")
         
-        # Preparar respuesta
-        response_data = {
-            'session_id': session_id,
-            'export_format': export_format,
-            'filename': filename,
-            'file_size_bytes': len(export_content) if isinstance(export_content, bytes) else len(export_content.encode('utf-8')),
-            'download_url': download_url,
-            'export_options': export_options,
-            'status': 'exported',
-            'message': f'Test plan exported successfully in {export_format} format'
-        }
+        # Generar archivo según el formato
+        file_content = None
+        file_name = f"plan_{session_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        content_type = 'application/octet-stream'
         
-        # Si no hay S3, incluir el contenido en base64 para formatos pequeños
-        if not download_url and export_format in ['JSON', 'CSV']:
-            if len(export_content) < 1000000:  # Menos de 1MB
-                response_data['content_base64'] = base64.b64encode(export_content.encode('utf-8')).decode('utf-8')
+        if export_format == 'excel':
+            file_content, content_type = generate_excel_file(test_plan, plan_config, include_metadata)
+            file_name += '.xlsx'
+        elif export_format == 'pdf':
+            file_content, content_type = generate_pdf_file(test_plan, plan_config, include_metadata)
+            file_name += '.pdf'
+        elif export_format == 'json':
+            file_content, content_type = generate_json_file(test_plan, plan_config, include_metadata)
+            file_name += '.json'
+        elif export_format == 'csv':
+            file_content, content_type = generate_csv_file(test_plan, plan_config, include_metadata)
+            file_name += '.csv'
         
-        return success_response(response_data)
+        if file_content is None:
+            return error_response(500, f'Failed to generate {export_format} file')
         
-    except Exception as e:
-        logger.error(f"Error: {str(e)}")
-        return error_response(500, 'Internal server error', str(e))
-
-def export_to_json(session_data: Dict[str, Any], options: Dict[str, Any]) -> tuple:
-    """Exportar a formato JSON"""
-    
-    export_data = {
-        'export_info': {
-            'exported_at': datetime.utcnow().isoformat(),
-            'format': 'JSON',
-            'version': '1.0'
-        },
-        'plan_configuration': session_data.get('plan_configuration', {}),
-        'session_info': {
-            'id': session_data.get('id'),
-            'tester_id': session_data.get('tester_id'),
-            'status': session_data.get('status'),
-            'created_at': session_data.get('created_at'),
-            'updated_at': session_data.get('updated_at')
-        }
-    }
-    
-    # Filtrar y procesar casos de prueba
-    if options.get('include_iterations', True):
-        filtered_iterations = []
-        for iteration in session_data.get('iterations', []):
-            filtered_cases = filter_test_cases(
-                iteration.get('test_cases', []), 
-                options.get('filter_by_priority'),
-                options.get('filter_by_category')
+        # Subir archivo a S3
+        try:
+            s3_key = f"exports/{session_id}/{file_name}"
+            
+            s3_client.put_object(
+                Bucket=s3_bucket,
+                Key=s3_key,
+                Body=file_content,
+                ContentType=content_type,
+                ContentDisposition=f'attachment; filename="{file_name}"'
             )
             
-            if filtered_cases:
-                filtered_iteration = {
-                    'iteration_number': iteration.get('iteration_number'),
-                    'created_at': iteration.get('created_at'),
-                    'test_cases': filtered_cases
-                }
-                filtered_iterations.append(filtered_iteration)
-        
-        export_data['iterations'] = filtered_iterations
-    
-    # Incluir métricas si se solicita
-    if options.get('include_metrics', True):
-        export_data['coverage_metrics'] = session_data.get('coverage_metrics', {})
-    
-    return json.dumps(export_data, indent=2, ensure_ascii=False), 'application/json'
+            # Generar URL de descarga con expiración
+            download_url = s3_client.generate_presigned_url(
+                'get_object',
+                Params={'Bucket': s3_bucket, 'Key': s3_key},
+                ExpiresIn=3600  # 1 hora
+            )
+            
+            expires_at = (datetime.utcnow() + timedelta(hours=1)).isoformat()
+            
+            logger.info(f"File uploaded to S3: {s3_key}")
+            
+            return success_response({
+                'download_url': download_url,
+                'file_name': file_name,
+                'expires_at': expires_at,
+                'format': export_format,
+                'file_size': len(file_content) if isinstance(file_content, (bytes, str)) else 0
+            })
+            
+        except Exception as e:
+            logger.error(f"Error uploading to S3: {str(e)}")
+            # Fallback: devolver archivo como base64
+            if isinstance(file_content, str):
+                file_content = file_content.encode('utf-8')
+            
+            file_base64 = base64.b64encode(file_content).decode('utf-8')
+            
+            return success_response({
+                'download_url': f'data:{content_type};base64,{file_base64}',
+                'file_name': file_name,
+                'expires_at': expires_at,
+                'format': export_format,
+                'file_size': len(file_content)
+            })
+            
+    except Exception as e:
+        logger.error(f"Export failed: {str(e)}")
+        return error_response(500, 'Export failed', str(e))
 
-def export_to_csv(session_data: Dict[str, Any], options: Dict[str, Any]) -> tuple:
-    """Exportar a formato CSV"""
+def generate_excel_file(test_plan: Dict, plan_config: Dict, include_metadata: bool) -> tuple:
+    """Generar archivo Excel con los casos de prueba"""
+    if openpyxl is None:
+        logger.error("openpyxl not available, cannot generate Excel file")
+        return None, None
     
-    output = io.StringIO()
-    writer = csv.writer(output)
-    
-    # Encabezados
-    headers = [
-        'Iteration', 'Case ID', 'Title', 'Description', 'Priority', 'Category',
-        'Preconditions', 'Steps', 'Expected Result', 'Estimated Time (min)',
-        'Requirements Covered', 'Tags', 'Created At', 'Updated At'
-    ]
-    
-    # Agregar campos personalizados
-    if options.get('custom_fields'):
-        headers.extend(options['custom_fields'])
-    
-    writer.writerow(headers)
-    
-    # Datos
-    for iteration in session_data.get('iterations', []):
-        filtered_cases = filter_test_cases(
-            iteration.get('test_cases', []),
-            options.get('filter_by_priority'),
-            options.get('filter_by_category')
+    try:
+        # Crear workbook
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Plan de Pruebas"
+        
+        # Estilos
+        header_font = Font(bold=True, color="FFFFFF")
+        header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
+        border = Border(
+            left=Side(style='thin'),
+            right=Side(style='thin'),
+            top=Side(style='thin'),
+            bottom=Side(style='thin')
         )
         
-        for case in filtered_cases:
-            row = [
-                iteration.get('iteration_number', ''),
-                case.get('id', ''),
-                case.get('title', ''),
-                case.get('description', ''),
-                case.get('priority', ''),
-                case.get('category', ''),
-                case.get('preconditions', ''),
-                ' | '.join(case.get('steps', [])),
-                case.get('expected_result', ''),
-                case.get('estimated_time', ''),
-                ', '.join(case.get('requirements_covered', [])),
-                ', '.join(case.get('tags', [])),
-                case.get('created_at', ''),
-                case.get('updated_at', '')
+        # Información del plan
+        if include_metadata:
+            ws['A1'] = "PLAN DE PRUEBAS"
+            ws['A1'].font = Font(bold=True, size=16)
+            ws.merge_cells('A1:H1')
+            
+            ws['A3'] = "Título:"
+            ws['B3'] = plan_config.get('plan_title', 'Sin título')
+            ws['A4'] = "Tipo:"
+            ws['B4'] = plan_config.get('plan_type', 'No especificado')
+            ws['A5'] = "Cobertura objetivo:"
+            ws['B5'] = f"{plan_config.get('coverage_percentage', 0)}%"
+            ws['A6'] = "Fecha de generación:"
+            ws['B6'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            
+            start_row = 8
+        else:
+            start_row = 1
+        
+        # Headers de la tabla
+        headers = [
+            "Número", "Nombre del Caso", "Descripción", "Precondiciones",
+            "Pasos de Prueba", "Resultados Esperados", "Prioridad", "Estado"
+        ]
+        
+        for col, header in enumerate(headers, 1):
+            cell = ws.cell(row=start_row, column=col, value=header)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.border = border
+            cell.alignment = Alignment(horizontal='center', vertical='center')
+        
+        # Datos de los casos de prueba
+        test_cases = test_plan.get('test_cases', [])
+        for row, test_case in enumerate(test_cases, start_row + 1):
+            ws.cell(row=row, column=1, value=test_case.get('testcase_number', row - start_row))
+            ws.cell(row=row, column=2, value=test_case.get('test_case_name', ''))
+            ws.cell(row=row, column=3, value=test_case.get('test_case_description', ''))
+            ws.cell(row=row, column=4, value=test_case.get('preconditions', ''))
+            
+            # Convertir pasos a texto
+            steps = test_case.get('test_steps', [])
+            if isinstance(steps, list):
+                steps_text = '\n'.join([f"{i+1}. {step}" for i, step in enumerate(steps)])
+            else:
+                steps_text = str(steps)
+            ws.cell(row=row, column=5, value=steps_text)
+            
+            ws.cell(row=row, column=6, value=test_case.get('expected_results', ''))
+            ws.cell(row=row, column=7, value=test_case.get('priority', 'MEDIA'))
+            ws.cell(row=row, column=8, value=test_case.get('status', 'PROPOSED'))
+            
+            # Aplicar bordes
+            for col in range(1, len(headers) + 1):
+                ws.cell(row=row, column=col).border = border
+        
+        # Ajustar ancho de columnas
+        column_widths = [10, 25, 35, 20, 30, 25, 12, 12]
+        for col, width in enumerate(column_widths, 1):
+            ws.column_dimensions[get_column_letter(col)].width = width
+        
+        # Guardar en memoria
+        output = io.BytesIO()
+        wb.save(output)
+        output.seek(0)
+        
+        return output.getvalue(), 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        
+    except Exception as e:
+        logger.error(f"Error generating Excel file: {str(e)}")
+        return None, None
+
+def generate_pdf_file(test_plan: Dict, plan_config: Dict, include_metadata: bool) -> tuple:
+    """Generar archivo PDF con los casos de prueba"""
+    if SimpleDocTemplate is None:
+        logger.error("reportlab not available, cannot generate PDF file")
+        return None, None
+    
+    try:
+        output = io.BytesIO()
+        doc = SimpleDocTemplate(output, pagesize=A4)
+        story = []
+        
+        styles = getSampleStyleSheet()
+        title_style = ParagraphStyle(
+            'CustomTitle',
+            parent=styles['Heading1'],
+            fontSize=18,
+            spaceAfter=30,
+            alignment=1  # Center
+        )
+        
+        # Título
+        story.append(Paragraph("PLAN DE PRUEBAS", title_style))
+        story.append(Spacer(1, 20))
+        
+        # Información del plan
+        if include_metadata:
+            info_data = [
+                ['Título:', plan_config.get('plan_title', 'Sin título')],
+                ['Tipo:', plan_config.get('plan_type', 'No especificado')],
+                ['Cobertura objetivo:', f"{plan_config.get('coverage_percentage', 0)}%"],
+                ['Fecha de generación:', datetime.now().strftime('%Y-%m-%d %H:%M:%S')],
+                ['Total de casos:', str(len(test_plan.get('test_cases', [])))]
             ]
             
-            # Agregar campos personalizados
-            for field in options.get('custom_fields', []):
-                row.append(case.get(field, ''))
+            info_table = Table(info_data, colWidths=[2*inch, 4*inch])
+            info_table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (0, -1), colors.lightgrey),
+                ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
+                ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+                ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, -1), 10),
+                ('GRID', (0, 0), (-1, -1), 1, colors.black)
+            ]))
             
-            writer.writerow(row)
-    
-    return output.getvalue(), 'text/csv'
-
-def export_to_excel(session_data: Dict[str, Any], options: Dict[str, Any]) -> tuple:
-    """Exportar a formato Excel (simulado como CSV mejorado)"""
-    # En una implementación real, usarías openpyxl o xlsxwriter
-    # Por simplicidad, retornamos CSV con metadata adicional
-    
-    csv_content, _ = export_to_csv(session_data, options)
-    
-    # Agregar metadata al inicio
-    metadata = f"""# Test Plan Export
-# Plan: {session_data.get('plan_configuration', {}).get('plan_title', 'N/A')}
-# Type: {session_data.get('plan_configuration', {}).get('plan_type', 'N/A')}
-# Exported: {datetime.utcnow().isoformat()}
-# Format: Excel (CSV)
-
-"""
-    
-    return (metadata + csv_content).encode('utf-8'), 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-
-def export_to_pdf(session_data: Dict[str, Any], options: Dict[str, Any]) -> tuple:
-    """Exportar a formato PDF (simulado como texto estructurado)"""
-    # En una implementación real, usarías reportlab o weasyprint
-    
-    content = []
-    content.append("TEST PLAN EXPORT REPORT")
-    content.append("=" * 50)
-    content.append("")
-    
-    # Información del plan
-    plan_config = session_data.get('plan_configuration', {})
-    content.append(f"Plan Title: {plan_config.get('plan_title', 'N/A')}")
-    content.append(f"Plan Type: {plan_config.get('plan_type', 'N/A')}")
-    content.append(f"Target Coverage: {plan_config.get('coverage_percentage', 'N/A')}%")
-    content.append(f"Exported: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}")
-    content.append("")
-    
-    # Métricas si se incluyen
-    if options.get('include_metrics') and 'coverage_metrics' in session_data:
-        metrics = session_data['coverage_metrics']
-        content.append("COVERAGE METRICS")
-        content.append("-" * 20)
-        if 'summary' in metrics:
-            summary = metrics['summary']
-            content.append(f"Total Test Cases: {summary.get('total_test_cases', 0)}")
-            content.append(f"Coverage: {summary.get('actual_coverage_percentage', 0)}%")
-            content.append(f"Estimated Time: {summary.get('total_estimated_time_hours', 0)} hours")
-        content.append("")
-    
-    # Casos de prueba
-    content.append("TEST CASES")
-    content.append("-" * 20)
-    
-    for iteration in session_data.get('iterations', []):
-        filtered_cases = filter_test_cases(
-            iteration.get('test_cases', []),
-            options.get('filter_by_priority'),
-            options.get('filter_by_category')
-        )
+            story.append(info_table)
+            story.append(Spacer(1, 30))
         
-        if filtered_cases:
-            content.append(f"\nIteration {iteration.get('iteration_number', 'N/A')}:")
-            
-            for i, case in enumerate(filtered_cases, 1):
-                content.append(f"\n{i}. {case.get('title', 'Untitled')}")
-                content.append(f"   Priority: {case.get('priority', 'N/A')}")
-                content.append(f"   Category: {case.get('category', 'N/A')}")
-                content.append(f"   Description: {case.get('description', 'N/A')}")
-                content.append(f"   Steps: {' | '.join(case.get('steps', []))}")
-                content.append(f"   Expected: {case.get('expected_result', 'N/A')}")
-    
-    pdf_content = "\n".join(content)
-    return pdf_content.encode('utf-8'), 'application/pdf'
+        # Tabla de casos de prueba
+        story.append(Paragraph("CASOS DE PRUEBA", styles['Heading2']))
+        story.append(Spacer(1, 10))
+        
+        # Headers
+        headers = ['#', 'Nombre', 'Descripción', 'Prioridad']
+        table_data = [headers]
+        
+        # Datos
+        test_cases = test_plan.get('test_cases', [])
+        for i, test_case in enumerate(test_cases, 1):
+            row = [
+                str(i),
+                test_case.get('test_case_name', '')[:30] + '...' if len(test_case.get('test_case_name', '')) > 30 else test_case.get('test_case_name', ''),
+                test_case.get('test_case_description', '')[:50] + '...' if len(test_case.get('test_case_description', '')) > 50 else test_case.get('test_case_description', ''),
+                test_case.get('priority', 'MEDIA')
+            ]
+            table_data.append(row)
+        
+        table = Table(table_data, colWidths=[0.5*inch, 2*inch, 3*inch, 1*inch])
+        table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, -1), 8),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black),
+            ('VALIGN', (0, 0), (-1, -1), 'TOP')
+        ]))
+        
+        story.append(table)
+        
+        doc.build(story)
+        output.seek(0)
+        
+        return output.getvalue(), 'application/pdf'
+        
+    except Exception as e:
+        logger.error(f"Error generating PDF file: {str(e)}")
+        return None, None
 
-def filter_test_cases(test_cases: List[Dict], priority_filter: str = None, category_filter: str = None) -> List[Dict]:
-    """Filtrar casos de prueba según criterios"""
-    filtered_cases = test_cases
-    
-    if priority_filter:
-        filtered_cases = [case for case in filtered_cases if case.get('priority') == priority_filter]
-    
-    if category_filter:
-        filtered_cases = [case for case in filtered_cases if case.get('category') == category_filter]
-    
-    return filtered_cases
+def generate_json_file(test_plan: Dict, plan_config: Dict, include_metadata: bool) -> tuple:
+    """Generar archivo JSON con los casos de prueba"""
+    try:
+        export_data = {
+            'test_plan': test_plan,
+            'exported_at': datetime.utcnow().isoformat(),
+            'format': 'json'
+        }
+        
+        if include_metadata:
+            export_data['plan_configuration'] = plan_config
+        
+        json_content = json.dumps(export_data, indent=2, default=decimal_default, ensure_ascii=False)
+        
+        return json_content.encode('utf-8'), 'application/json'
+        
+    except Exception as e:
+        logger.error(f"Error generating JSON file: {str(e)}")
+        return None, None
+
+def generate_csv_file(test_plan: Dict, plan_config: Dict, include_metadata: bool) -> tuple:
+    """Generar archivo CSV con los casos de prueba"""
+    try:
+        import csv
+        output = io.StringIO()
+        writer = csv.writer(output)
+        
+        # Headers
+        headers = [
+            'Número', 'Nombre del Caso', 'Descripción', 'Precondiciones',
+            'Pasos de Prueba', 'Resultados Esperados', 'Prioridad', 'Estado'
+        ]
+        writer.writerow(headers)
+        
+        # Datos
+        test_cases = test_plan.get('test_cases', [])
+        for i, test_case in enumerate(test_cases, 1):
+            steps = test_case.get('test_steps', [])
+            if isinstance(steps, list):
+                steps_text = '; '.join(steps)
+            else:
+                steps_text = str(steps)
+            
+            row = [
+                test_case.get('testcase_number', i),
+                test_case.get('test_case_name', ''),
+                test_case.get('test_case_description', ''),
+                test_case.get('preconditions', ''),
+                steps_text,
+                test_case.get('expected_results', ''),
+                test_case.get('priority', 'MEDIA'),
+                test_case.get('status', 'PROPOSED')
+            ]
+            writer.writerow(row)
+        
+        csv_content = output.getvalue()
+        output.close()
+        
+        return csv_content.encode('utf-8'), 'text/csv'
+        
+    except Exception as e:
+        logger.error(f"Error generating CSV file: {str(e)}")
+        return None, None
 
 def success_response(data):
     return {
         'statusCode': 200,
         'headers': cors_headers(),
-        'body': json.dumps({**data, 'timestamp': datetime.utcnow().isoformat()})
+        'body': json.dumps({**data, 'timestamp': datetime.utcnow().isoformat()}, default=decimal_default)
     }
 
 def error_response(status_code, message, details=None):
@@ -339,7 +458,7 @@ def error_response(status_code, message, details=None):
             'error': message,
             'details': details,
             'timestamp': datetime.utcnow().isoformat()
-        })
+        }, default=decimal_default)
     }
 
 def cors_response():

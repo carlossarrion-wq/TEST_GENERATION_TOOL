@@ -47,7 +47,7 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
         except Exception as e:
             return error_response(400, f'Error parsing request body: {str(e)}')
         
-        required_fields = ['plan_title', 'plan_type', 'coverage_percentage', 'project_context']
+        required_fields = ['plan_title', 'plan_type', 'coverage_percentage', 'min_test_cases', 'max_test_cases', 'project_context']
         missing_fields = [field for field in required_fields if field not in body]
         
         if missing_fields:
@@ -61,6 +61,19 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
         if not isinstance(coverage, (int, float)) or coverage < 10 or coverage > 100:
             return error_response(400, 'Coverage percentage must be between 10 and 100')
         
+        # Validar número de casos de prueba
+        min_cases = body['min_test_cases']
+        max_cases = body['max_test_cases']
+        
+        if not isinstance(min_cases, int) or min_cases < 1 or min_cases > 100:
+            return error_response(400, 'min_test_cases must be an integer between 1 and 100')
+        
+        if not isinstance(max_cases, int) or max_cases < 1 or max_cases > 100:
+            return error_response(400, 'max_test_cases must be an integer between 1 and 100')
+        
+        if min_cases > max_cases:
+            return error_response(400, 'min_test_cases cannot be greater than max_test_cases')
+        
         session_id = str(uuid.uuid4())
         current_time = datetime.utcnow().isoformat()
         
@@ -70,6 +83,8 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
             'plan_title': body['plan_title'],
             'plan_type': body['plan_type'],
             'coverage_percentage': coverage,
+            'min_test_cases': min_cases,
+            'max_test_cases': max_cases,
             'project_context': body['project_context']
         }
         

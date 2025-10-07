@@ -193,11 +193,26 @@ def generate_test_cases_with_claude(plan_config: Dict, context_results: List[Dic
     # Prompts ultra-optimizados para máxima velocidad
     system_prompt = "Genera casos de prueba en formato JSON. Devuelve únicamente JSON válido sin explicaciones."
     
+    # Determinar número de casos a generar basado en la configuración
+    min_cases = plan_config.get('min_test_cases', 5)
+    max_cases = plan_config.get('max_test_cases', 15)
+    
+    # Usar el promedio del rango como objetivo, pero permitir que Claude ajuste según complejidad
+    target_cases = (min_cases + max_cases) // 2
+    
     # Prompt conciso del usuario con información esencial únicamente
-    user_prompt = f"""Genera 8 casos de prueba para testing {plan_config['plan_type']}:
+    user_prompt = f"""Genera entre {min_cases} y {max_cases} casos de prueba para testing {plan_config['plan_type']}:
+
+ESPECIFICACIONES:
+- Tipo: {plan_config['plan_type']}
+- Cobertura objetivo: {plan_config['coverage_percentage']}%
+- Número de casos: Entre {min_cases} y {max_cases} casos (objetivo: {target_cases})
 
 REQUERIMIENTO:
 {user_instructions if user_instructions else plan_config['project_context']}
+
+INSTRUCCIONES:
+Ajusta la cantidad de casos según la complejidad del proyecto, pero respeta el rango {min_cases}-{max_cases}.
 
 Devuelve JSON:
 {{

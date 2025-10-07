@@ -71,6 +71,8 @@ export interface PlanConfiguration {
   plan_type: PlanType;
   functional_requirements_doc?: File;
   coverage_percentage: number;
+  min_test_cases: number;
+  max_test_cases: number;
   project_context: string;
 }
 
