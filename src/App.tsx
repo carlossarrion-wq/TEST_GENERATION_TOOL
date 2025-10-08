@@ -1,6 +1,13 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { appConfig, validateConfig, createLogger } from './config';
-import type { PlanConfiguration, TestPlan, Session, PlanType, ConversationMessage, ChatSession } from './types';
+import type { 
+  PlanConfiguration, 
+  TestPlan, 
+  Session, 
+  PlanType, 
+  ConversationMessage, 
+  ChatSession
+} from './types';
 import './styles/App.css';
 
 const logger = createLogger('App');
@@ -10,6 +17,7 @@ const App: React.FC = () => {
   // Estados principales
   const [currentStep, setCurrentStep] = useState(0);
   const [showPreviewModal, setShowPreviewModal] = useState(false);
+  const [selectedTestCase, setSelectedTestCase] = useState<any>(null);
   const [exportLoading, setExportLoading] = useState(false);
   const [isConfigValid, setIsConfigValid] = useState(false);
   const [currentSession, setCurrentSession] = useState<Session | null>(null);
@@ -26,7 +34,7 @@ const App: React.FC = () => {
     plan_type: 'UNITARIAS' as PlanType,
     coverage_percentage: 80,
     min_test_cases: 5,
-    max_test_cases: 15,
+    max_test_cases: 8,
     project_context: '',
   });
 
@@ -37,6 +45,12 @@ const App: React.FC = () => {
   const [isChatLoading, setIsChatLoading] = useState(false);
   const [isTyping, setIsTyping] = useState(false);
   const chatMessagesRef = useRef<HTMLDivElement>(null);
+
+  // Estados para eliminación de casos
+  const [deletedCase, setDeletedCase] = useState<{case: any, index: number} | null>(null);
+  const [showUndoPopup, setShowUndoPopup] = useState(false);
+  const [undoTimer, setUndoTimer] = useState<number | null>(null);
+
 
   // Verificar configuración al cargar
   useEffect(() => {
@@ -56,6 +70,7 @@ const App: React.FC = () => {
 
     initializeSystem();
   }, []);
+
 
   // Función de validación
   const validateForm = () => {
@@ -117,6 +132,7 @@ const App: React.FC = () => {
           min_test_cases: formData.min_test_cases,
           max_test_cases: formData.max_test_cases,
           project_context: formData.project_context,
+          // user_id no requerido por ahora - será agregado cuando se implemente login
         }),
       });
 
@@ -602,25 +618,10 @@ ${errorMessage}`;
   const initializeChatSession = () => {
     if (!testPlan || !planConfig) return;
 
-    // Crear lista detallada de casos de prueba con formato simple
-    const testCasesList = testPlan.test_cases.map((testCase, index) => 
-      `${index + 1}. ${testCase.test_case_name}\n - 📝 Descripción: ${testCase.test_case_description}\n - 🎯 Prioridad: ${testCase.priority}\n - ⚙️ Precondiciones: ${testCase.preconditions}\n - ✅ Resultados esperados: ${testCase.expected_results}`
-    ).join('\n\n');
-
     const initialMessage: ConversationMessage = {
       role: 'system',
-      content: `He generado un plan de pruebas para tu proyecto "${planConfig.plan_title}". 
-
-📋 **Resumen del Plan:**
-- Tipo: ${planConfig.plan_type}
-- Cobertura objetivo: ${planConfig.coverage_percentage}%
-- Total de casos: ${testPlan.test_cases.length}
-
-📝 **Casos de Prueba Generados:**
-
-${testCasesList}
-
-¿Te gustaría revisar algún aspecto específico del plan, hacer modificaciones, o tienes preguntas sobre algún caso en particular?`,
+      content: `¡Hola! 👋 He generado exitosamente tu plan de pruebas personalizado.\n\n\n📋 PLAN DE PRUEBAS: ${planConfig.plan_title}\n\n\n🎯 INFORMACIÓN DEL PLAN\n• Tipo de pruebas: ${planConfig.plan_type}\n• Cobertura objetivo: ${planConfig.coverage_percentage}%\n• Casos generados: ${testPlan.test_cases.length} casos de prueba\n• Rango solicitado: ${planConfig.min_test_cases} - ${planConfig.max_test_cases} casos\n\n\n📝 CASOS DE PRUEBA GENERADOS\n\n${testPlan.test_cases.map((testCase, index) => 
+  `${index + 1}. ${testCase.test_case_name}\n📄 Descripción: ${testCase.test_case_description}\n🎯 Prioridad: ${testCase.priority}\n⚙️ Precondiciones: ${testCase.preconditions}\n✅ Resultado esperado: ${testCase.expected_results}\n\n`).join('')}💬 ¿CÓMO PUEDO AYUDARTE?\n\nPuedes preguntarme sobre:\n• Detalles específicos de cualquier caso de prueba\n• Sugerencias para mejorar la cobertura\n• Modificaciones o casos adicionales\n• Explicaciones sobre la metodología utilizada\n\n¡Estoy aquí para ayudarte a perfeccionar tu plan de pruebas! 🚀`,
       timestamp: new Date().toISOString(),
     };
 
@@ -644,6 +645,86 @@ ${testCasesList}
   const addMessage = (message: ConversationMessage) => {
     setChatMessages(prev => [...prev, message]);
     setTimeout(scrollToBottom, 100);
+  };
+
+  // Función para procesar comandos de la IA
+  const processAICommands = (assistantResponse: string) => {
+    if (!testPlan) {
+      console.log('❌ No hay testPlan disponible para procesar comandos');
+      return;
+    }
+
+    console.log('🔍 Procesando respuesta de IA para comandos:', assistantResponse);
+    console.log('📊 Casos actuales en testPlan:', testPlan.test_cases.length);
+
+    // Patrones más amplios para detectar comandos de eliminación
+    const deletePatterns = [
+      /eliminar\s+(?:el\s+)?caso\s+(\d+)/gi,
+      /remover\s+(?:el\s+)?caso\s+(\d+)/gi,
+      /quitar\s+(?:el\s+)?caso\s+(\d+)/gi,
+      /borrar\s+(?:el\s+)?caso\s+(\d+)/gi,
+      /eliminar\s+tc[_-]?(\d+)/gi,
+      /caso\s+(\d+).*(?:eliminar|remover|quitar|borrar)/gi,
+      /(?:eliminar|remover|quitar|borrar).*caso\s+(\d+)/gi
+    ];
+
+    let foundCommands = false;
+
+    deletePatterns.forEach((pattern, patternIndex) => {
+      const matches = Array.from(assistantResponse.matchAll(pattern));
+      if (matches.length > 0) {
+        console.log(`✅ Patrón ${patternIndex + 1} encontró comandos:`, matches);
+        foundCommands = true;
+        
+        matches.forEach((match, matchIndex) => {
+          const caseNumber = parseInt(match[1]);
+          console.log(`🎯 Comando ${matchIndex + 1}: Eliminar caso ${caseNumber}`);
+          
+          if (caseNumber > 0 && caseNumber <= testPlan.test_cases.length) {
+            const caseIndex = caseNumber - 1;
+            const caseToDelete = testPlan.test_cases[caseIndex];
+            
+            console.log(`✅ Caso válido encontrado:`, {
+              numero: caseNumber,
+              indice: caseIndex,
+              nombre: caseToDelete.test_case_name
+            });
+            
+            // Ejecutar eliminación con delay
+            setTimeout(() => {
+              console.log(`🗑️ Ejecutando eliminación del caso ${caseNumber}`);
+              handleDeleteTestCase(caseIndex);
+            }, 1000);
+          } else {
+            console.log(`❌ Número de caso inválido: ${caseNumber}. Debe estar entre 1 y ${testPlan.test_cases.length}`);
+          }
+        });
+      }
+    });
+
+    if (!foundCommands) {
+      console.log('ℹ️ No se encontraron comandos de eliminación en la respuesta');
+      
+      // Mostrar fragmentos de la respuesta para debugging
+      const words = assistantResponse.toLowerCase().split(' ');
+      const relevantWords = words.filter(word => 
+        ['eliminar', 'remover', 'quitar', 'borrar', 'caso'].some(keyword => 
+          word.includes(keyword)
+        )
+      );
+      
+      if (relevantWords.length > 0) {
+        console.log('🔍 Palabras relevantes encontradas:', relevantWords);
+      }
+    }
+
+    // Detectar comandos de modificación (futuro)
+    const modifyPattern = /modificar caso (\d+)|cambiar caso (\d+)|actualizar caso (\d+)/gi;
+    const modifyMatches = Array.from(assistantResponse.matchAll(modifyPattern));
+    
+    if (modifyMatches.length > 0) {
+      console.log('🔧 Comandos de modificación detectados:', modifyMatches);
+    }
   };
 
   const handleSendMessage = async () => {
@@ -699,7 +780,16 @@ ${testCasesList}
             role: msg.role,
             content: msg.content,
             timestamp: msg.timestamp
-          }))
+          })),
+        // Incluir información sobre capacidades de modificación
+        system_capabilities: {
+          can_modify_plan: true,
+          supported_commands: [
+            "eliminar caso [número]",
+            "modificar caso [número]",
+            "agregar caso"
+          ]
+        }
       };
 
       logger.info('Request body para KB:', requestBody);
@@ -772,6 +862,9 @@ ${testCasesList}
           timestamp: new Date().toISOString(),
         };
         addMessage(assistantMessage);
+        
+        // Procesar comandos de la IA después de mostrar la respuesta
+        processAICommands(assistantResponse);
       }, 2000);
 
     } catch (error) {
@@ -813,74 +906,263 @@ ${testCasesList}
     scrollToBottom();
   }, [chatMessages]);
 
+  // Función para eliminar un caso de prueba
+  const handleDeleteTestCase = (index: number) => {
+    if (!testPlan) return;
+
+    const caseToDelete = testPlan.test_cases[index];
+    
+    // Guardar el caso eliminado para poder deshacerlo
+    setDeletedCase({ case: caseToDelete, index });
+    
+    // Crear nueva versión del plan sin el caso eliminado
+    const updatedTestCases = testPlan.test_cases.filter((_, i) => i !== index);
+    const updatedTestPlan = {
+      ...testPlan,
+      test_cases: updatedTestCases
+    };
+    
+    setTestPlan(updatedTestPlan);
+    setShowUndoPopup(true);
+    
+    // Timer para auto-ocultar el popup después de 5 segundos
+    const timer = window.setTimeout(() => {
+      setShowUndoPopup(false);
+      setDeletedCase(null);
+    }, 5000);
+    
+    setUndoTimer(timer);
+  };
+
+  // Función para deshacer la eliminación
+  const handleUndoDelete = () => {
+    if (!deletedCase || !testPlan) return;
+
+    // Recrear el array con el caso restaurado en su posición original
+    const restoredTestCases = [...testPlan.test_cases];
+    restoredTestCases.splice(deletedCase.index, 0, deletedCase.case);
+    
+    const updatedTestPlan = {
+      ...testPlan,
+      test_cases: restoredTestCases
+    };
+    
+    setTestPlan(updatedTestPlan);
+    setShowUndoPopup(false);
+    setDeletedCase(null);
+    
+    // Limpiar el timer
+    if (undoTimer) {
+      window.clearTimeout(undoTimer);
+      setUndoTimer(null);
+    }
+  };
+
+  // Limpiar timer cuando el componente se desmonta
+  useEffect(() => {
+    return () => {
+      if (undoTimer) {
+        window.clearTimeout(undoTimer);
+      }
+    };
+  }, [undoTimer]);
+
   // Renderizar modal de vista previa
   const renderPreviewModal = () => {
     if (!showPreviewModal || !testPlan || !planConfig) return null;
 
     return (
-      <div className="modal-overlay" onClick={() => setShowPreviewModal(false)}>
+      <div className="modal-overlay" onClick={() => {
+        setShowPreviewModal(false);
+        setSelectedTestCase(null);
+      }}>
         <div className="modal-content" onClick={(e) => e.stopPropagation()}>
           <div className="modal-header">
-            <h2>👁️ Vista Previa del Plan</h2>
+            <h2>
+              {selectedTestCase ? '🔍 Detalle del Caso de Prueba' : '👁️ Vista Previa del Plan'}
+            </h2>
             <button 
               className="modal-close"
-              onClick={() => setShowPreviewModal(false)}
+              onClick={() => {
+                setShowPreviewModal(false);
+                setSelectedTestCase(null);
+              }}
             >
               ✕
             </button>
           </div>
           
           <div className="modal-body">
-            {/* Resumen del plan */}
-            <div className="preview-summary">
-              <h3>📋 {planConfig.plan_title}</h3>
-              <div className="preview-stats">
-                <span>📊 {testPlan.test_cases.length} casos</span>
-                <span>🎯 {planConfig.plan_type}</span>
-                <span>📈 {testPlan.coverage_metrics.target_coverage}% cobertura</span>
-              </div>
-            </div>
+            {selectedTestCase ? (
+              // Vista detallada del caso seleccionado
+              <div className="test-case-detail">
+                <div className="detail-header">
+                  <button 
+                    className="btn btn-secondary"
+                    onClick={() => setSelectedTestCase(null)}
+                    style={{ marginBottom: '20px' }}
+                  >
+                    ← Volver a la lista
+                  </button>
+                  <div className="case-number-large">
+                    TC_{String(selectedTestCase.index + 1).padStart(3, '0')}
+                  </div>
+                </div>
 
-            {/* Lista de casos de prueba */}
-            <div className="preview-cases-list">
-              <h4>Casos de Prueba:</h4>
-              <div className="cases-container">
-                {testPlan.test_cases.map((testCase, index) => (
-                  <div key={index} className="preview-case-item">
-                    <div className="case-number">TC_{String(index + 1).padStart(3, '0')}</div>
-                    <div className="case-details">
-                      <div className="case-name">{testCase.test_case_name}</div>
-                      <div className="case-description">{testCase.test_case_description}</div>
-                      <div className="case-priority">Prioridad: {testCase.priority}</div>
+                <div className="detail-content">
+                  {/* Nombre del Caso - Siempre se muestra */}
+                  <div className="detail-section">
+                    <h4>📝 Nombre del Caso</h4>
+                    <p>{selectedTestCase.test_case_name}</p>
+                  </div>
+
+                  {/* Descripción - Siempre se muestra */}
+                  <div className="detail-section">
+                    <h4>📄 Descripción</h4>
+                    <p>{selectedTestCase.test_case_description}</p>
+                  </div>
+
+                  {/* Prioridad - Siempre se muestra */}
+                  <div className="detail-section">
+                    <h4>🎯 Prioridad</h4>
+                    <span className={`priority-badge priority-${selectedTestCase.priority?.toLowerCase()}`}>
+                      {selectedTestCase.priority}
+                    </span>
+                  </div>
+
+                  {/* Precondiciones - Solo si tiene contenido */}
+                  {selectedTestCase.preconditions && 
+                   selectedTestCase.preconditions.trim() !== '' && 
+                   selectedTestCase.preconditions !== 'No especificadas' && (
+                    <div className="detail-section">
+                      <h4>⚙️ Precondiciones</h4>
+                      <p>{selectedTestCase.preconditions}</p>
+                    </div>
+                  )}
+
+                  {/* Pasos de Prueba - Solo si tiene contenido */}
+                  {((Array.isArray(selectedTestCase.test_steps) && selectedTestCase.test_steps.length > 0) ||
+                    (selectedTestCase.test_steps && 
+                     selectedTestCase.test_steps.trim() !== '' && 
+                     selectedTestCase.test_steps !== 'No especificados')) && (
+                    <div className="detail-section">
+                      <h4>📋 Pasos de Prueba</h4>
+                      {Array.isArray(selectedTestCase.test_steps) ? (
+                        <ol className="test-steps-list">
+                          {selectedTestCase.test_steps.map((step, index) => (
+                            <li key={index}>{step}</li>
+                          ))}
+                        </ol>
+                      ) : (
+                        <p>{selectedTestCase.test_steps}</p>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Resultados Esperados - Siempre se muestra */}
+                  <div className="detail-section">
+                    <h4>✅ Resultados Esperados</h4>
+                    <p>{selectedTestCase.expected_results}</p>
+                  </div>
+
+                  {/* Datos de Prueba - Solo si tiene contenido */}
+                  {selectedTestCase.test_data && 
+                   selectedTestCase.test_data.trim() !== '' && 
+                   selectedTestCase.test_data !== 'No especificados' && (
+                    <div className="detail-section">
+                      <h4>📊 Datos de Prueba</h4>
+                      <p>{selectedTestCase.test_data}</p>
+                    </div>
+                  )}
+
+                  {/* Requisitos - Solo si tiene contenido */}
+                  {selectedTestCase.requirements && 
+                   selectedTestCase.requirements.trim() !== '' && 
+                   selectedTestCase.requirements !== 'No especificados' && (
+                    <div className="detail-section">
+                      <h4>📋 Requisitos</h4>
+                      <p>{selectedTestCase.requirements}</p>
+                    </div>
+                  )}
+
+                  {/* Información Adicional - Siempre se muestra */}
+                  <div className="detail-section">
+                    <h4>ℹ️ Información Adicional</h4>
+                    <div className="additional-info">
+                      <p><strong>Estado:</strong> {selectedTestCase.status}</p>
+                      <p><strong>Creado por:</strong> {selectedTestCase.created_by}</p>
+                      <p><strong>Última modificación:</strong> {new Date(selectedTestCase.last_modified).toLocaleString()}</p>
                     </div>
                   </div>
-                ))}
+                </div>
               </div>
-            </div>
+            ) : (
+              // Vista de lista de casos
+              <>
+                {/* Resumen del plan */}
+                <div className="preview-summary">
+                  <h3>📋 {planConfig.plan_title}</h3>
+                  <div className="preview-stats">
+                    <span>📊 {testPlan.test_cases.length} casos</span>
+                    <span>🎯 {planConfig.plan_type}</span>
+                    <span>📈 {testPlan.coverage_metrics.target_coverage}% cobertura</span>
+                  </div>
+                </div>
+
+                {/* Lista de casos de prueba */}
+                <div className="preview-cases-list">
+                  <h4>Casos de Prueba: <small>(Haz click en un caso para ver los detalles)</small></h4>
+                  <div className="cases-container">
+                    {testPlan.test_cases.map((testCase, index) => (
+                      <div 
+                        key={index} 
+                        className="preview-case-item clickable"
+                        onClick={() => setSelectedTestCase({ ...testCase, index })}
+                      >
+                        <div className="case-number">TC_{String(index + 1).padStart(3, '0')}</div>
+                        <div className="case-details">
+                          <div className="case-name">{testCase.test_case_name}</div>
+                          <div className="case-description">{testCase.test_case_description}</div>
+                          <div className="case-priority">Prioridad: {testCase.priority}</div>
+                        </div>
+                        <div className="case-arrow">→</div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </>
+            )}
           </div>
 
           <div className="modal-footer">
             <button 
               className="btn btn-secondary"
-              onClick={() => setShowPreviewModal(false)}
+              onClick={() => {
+                setShowPreviewModal(false);
+                setSelectedTestCase(null);
+              }}
               disabled={exportLoading}
             >
               Cerrar
             </button>
-            <button 
-              className="btn btn-primary"
-              onClick={handleDownloadExcel}
-              disabled={exportLoading}
-            >
-              {exportLoading ? 'Descargando...' : '📊 Descargar Excel'}
-            </button>
-            <button 
-              className="btn btn-primary"
-              onClick={handleDownloadJSON}
-              disabled={exportLoading}
-            >
-              {exportLoading ? 'Descargando...' : '🔧 Descargar JSON'}
-            </button>
+            {!selectedTestCase && (
+              <>
+                <button 
+                  className="btn btn-primary"
+                  onClick={handleDownloadExcel}
+                  disabled={exportLoading}
+                >
+                  {exportLoading ? 'Descargando...' : '📊 Descargar Excel'}
+                </button>
+                <button 
+                  className="btn btn-primary"
+                  onClick={handleDownloadJSON}
+                  disabled={exportLoading}
+                >
+                  {exportLoading ? 'Descargando...' : '🔧 Descargar JSON'}
+                </button>
+              </>
+            )}
           </div>
         </div>
       </div>
@@ -985,12 +1267,8 @@ ${testCasesList}
   // Renderizar formulario de configuración
   const renderConfigurationForm = () => (
     <div className="step-content">
-      <h2 style={{ color: '#1e293b', marginBottom: '30px', textAlign: 'center' }}>
-        📋 Configuración del Plan
-      </h2>
-      
       <div className="form-group">
-        <label className="form-label">
+        <label className="form-label important-label">
           📝 Título del Plan {validationErrors.plan_title && <span style={{ color: '#dc2626' }}>*</span>}
         </label>
         <input
@@ -1003,7 +1281,7 @@ ${testCasesList}
               setValidationErrors({ ...validationErrors, plan_title: false });
             }
           }}
-          className={`form-control ${validationErrors.plan_title ? 'error' : ''}`}
+          className={`form-control important-field ${validationErrors.plan_title ? 'error' : ''}`}
           placeholder="Ej: Plan de Pruebas - Sistema de Gestión"
           style={{
             borderColor: validationErrors.plan_title ? '#dc2626' : undefined,
@@ -1017,19 +1295,47 @@ ${testCasesList}
         )}
       </div>
 
-      {/* Selector de tipo de plan mejorado */}
+      <div className="form-group">
+        <label className="form-label important-label">
+          📋 Requisitos del Proyecto {validationErrors.project_context && <span style={{ color: '#dc2626' }}>*</span>}
+        </label>
+        <textarea
+          value={formData.project_context}
+          onChange={(e) => {
+            setFormData({ ...formData, project_context: e.target.value });
+            // Limpiar error cuando el usuario empiece a escribir
+            if (validationErrors.project_context && e.target.value.trim()) {
+              setValidationErrors({ ...validationErrors, project_context: false });
+            }
+          }}
+          rows={4}
+          className={`form-control important-field ${validationErrors.project_context ? 'error' : ''}`}
+          placeholder="Describe los requisitos del proyecto, funcionalidades a probar, casos de uso principales..."
+          style={{
+            borderColor: validationErrors.project_context ? '#dc2626' : undefined,
+            boxShadow: validationErrors.project_context ? '0 0 0 1px #dc2626' : undefined
+          }}
+        />
+        {validationErrors.project_context && (
+          <div style={{ color: '#dc2626', fontSize: '14px', marginTop: '5px' }}>
+            Este campo es obligatorio
+          </div>
+        )}
+      </div>
+
+      {/* Selector de tipo de plan refinado */}
       <div className="plan-type-selector">
         <div className="plan-type-header">
           <div className="plan-type-title">
-            🎯 Tipo de Plan
+            Tipo de Plan de Pruebas
           </div>
         </div>
         <div className="plan-type-options">
           {[
-            { value: 'UNITARIAS', icon: '🔬', name: 'Unitarias', desc: 'Pruebas de componentes individuales' },
-            { value: 'INTEGRACIÓN', icon: '🔗', name: 'Integración', desc: 'Pruebas de interacción entre módulos' },
-            { value: 'PERFORMANCE', icon: '⚡', name: 'Performance', desc: 'Pruebas de rendimiento y carga' },
-            { value: 'REGRESIÓN', icon: '🔄', name: 'Regresión', desc: 'Pruebas de funcionalidad existente' },
+            { value: 'UNITARIAS', name: 'Pruebas Unitarias', desc: 'Validación de componentes individuales y funciones específicas' },
+            { value: 'INTEGRACIÓN', name: 'Pruebas de Integración', desc: 'Verificación de interacciones entre módulos y sistemas' },
+            { value: 'PERFORMANCE', name: 'Pruebas de Performance', desc: 'Evaluación de rendimiento, carga y tiempo de respuesta' },
+            { value: 'REGRESIÓN', name: 'Pruebas de Regresión', desc: 'Validación de funcionalidades tras cambios o actualizaciones' },
           ].map((type) => (
             <div key={type.value} className="plan-type-option">
               <input
@@ -1041,9 +1347,11 @@ ${testCasesList}
                 onChange={(e) => setFormData({ ...formData, plan_type: e.target.value as PlanType })}
               />
               <label htmlFor={type.value} className="plan-type-card">
-                <div className="plan-type-icon">{type.icon}</div>
-                <div className="plan-type-name">{type.name}</div>
-                <div className="plan-type-description">{type.desc}</div>
+                <div className="plan-type-indicator"></div>
+                <div className="plan-type-content">
+                  <div className="plan-type-name">{type.name}</div>
+                  <div className="plan-type-description">{type.desc}</div>
+                </div>
               </label>
             </div>
           ))}
@@ -1119,59 +1427,105 @@ ${testCasesList}
           </div>
         </div>
 
-        {/* Selector de número de casos */}
-        <div className="test-cases-selector">
-          <div className="test-cases-header">
+        {/* Selector de número de casos con slider dual compacto */}
+        <div className="test-cases-slider-container">
+          <div className="test-cases-slider-header">
             <div className="test-cases-title">
               🔢 Número de Casos de Prueba
             </div>
+            <div className="test-cases-values">
+              <span className="test-cases-min">{formData.min_test_cases}</span>
+              <span className="test-cases-separator">-</span>
+              <span className="test-cases-max">{formData.max_test_cases}</span>
+              <span className="test-cases-unit">casos</span>
+            </div>
           </div>
           
-          <div className="test-cases-inputs">
-            <div className="test-case-input-group">
-              <label className="test-case-label">Mínimo</label>
-              <div className="test-case-input-container">
-                <input
-                  type="number"
-                  min="1"
-                  max="50"
-                  value={formData.min_test_cases}
-                  onChange={(e) => {
-                    const minValue = parseInt(e.target.value) || 1;
-                    const maxValue = Math.max(minValue, formData.max_test_cases);
-                    setFormData({ 
-                      ...formData, 
-                      min_test_cases: minValue,
-                      max_test_cases: maxValue
-                    });
-                  }}
-                  className="test-case-input"
-                />
-                <span className="test-case-unit">casos</span>
-              </div>
+          <div className="test-cases-slider-track">
+            <div className="dual-range-container">
+              {/* Slider para valor mínimo */}
+              <input
+                type="range"
+                min="1"
+                max="50"
+                value={formData.min_test_cases}
+                onChange={(e) => {
+                  const minValue = parseInt(e.target.value);
+                  const maxValue = Math.max(minValue, formData.max_test_cases);
+                  setFormData({ 
+                    ...formData, 
+                    min_test_cases: minValue,
+                    max_test_cases: maxValue
+                  });
+                }}
+                className="test-cases-range test-cases-range-min"
+              />
+              
+              {/* Slider para valor máximo */}
+              <input
+                type="range"
+                min="1"
+                max="50"
+                value={formData.max_test_cases}
+                onChange={(e) => {
+                  const maxValue = parseInt(e.target.value);
+                  const minValue = Math.min(formData.min_test_cases, maxValue);
+                  setFormData({ 
+                    ...formData, 
+                    min_test_cases: minValue,
+                    max_test_cases: maxValue
+                  });
+                }}
+                className="test-cases-range test-cases-range-max"
+              />
+              
+              {/* Barra de rango visual */}
+              <div 
+                className="test-cases-range-fill"
+                style={{
+                  left: `${((formData.min_test_cases - 1) / (50 - 1)) * 100}%`,
+                  width: `${((formData.max_test_cases - formData.min_test_cases) / (50 - 1)) * 100}%`
+                }}
+              ></div>
             </div>
-            
-            <div className="test-case-separator">-</div>
-            
-            <div className="test-case-input-group">
-              <label className="test-case-label">Máximo</label>
-              <div className="test-case-input-container">
-                <input
-                  type="number"
-                  min={formData.min_test_cases}
-                  max="100"
-                  value={formData.max_test_cases}
-                  onChange={(e) => {
-                    const maxValue = parseInt(e.target.value) || formData.min_test_cases;
-                    setFormData({ 
-                      ...formData, 
-                      max_test_cases: Math.max(maxValue, formData.min_test_cases)
-                    });
-                  }}
-                  className="test-case-input"
-                />
-                <span className="test-case-unit">casos</span>
-              </div>
+          </div>
+          
+          <div className="test-cases-labels" style={{ position: 'relative', marginTop: '10px', height: '40px' }}>
+            <div className="test-cases-label" style={{ 
+              position: 'absolute', 
+              left: '0%', 
+              transform: 'translateX(0%)',
+              textAlign: 'center'
+            }}>
+              <span>1</span>
+              <small style={{ display: 'block', fontSize: '11px', color: '#64748b' }}>Mínimo</small>
+            </div>
+            <div className="test-cases-label" style={{ 
+              position: 'absolute', 
+              left: '25%', 
+              transform: 'translateX(-50%)',
+              textAlign: 'center'
+            }}>
+              <span>13</span>
+              <small style={{ display: 'block', fontSize: '11px', color: '#64748b' }}>Medio</small>
+            </div>
+            <div className="test-cases-label" style={{ 
+              position: 'absolute', 
+              left: '75%', 
+              transform: 'translateX(-50%)',
+              textAlign: 'center'
+            }}>
+              <span>38</span>
+              <small style={{ display: 'block', fontSize: '11px', color: '#64748b' }}>Alto</small>
+            </div>
+            <div className="test-cases-label" style={{ 
+              position: 'absolute', 
+              left: '100%', 
+              transform: 'translateX(-100%)',
+              textAlign: 'center'
+            }}>
+              <span>50</span>
+              <small style={{ display: 'block', fontSize: '11px', color: '#64748b' }}>Máximo</small>
             </div>
           </div>
           
@@ -1186,35 +1540,7 @@ ${testCasesList}
         </div>
       </div>
 
-      <div className="form-group">
-        <label className="form-label">
-          🏗️ Contexto del Proyecto {validationErrors.project_context && <span style={{ color: '#dc2626' }}>*</span>}
-        </label>
-        <textarea
-          value={formData.project_context}
-          onChange={(e) => {
-            setFormData({ ...formData, project_context: e.target.value });
-            // Limpiar error cuando el usuario empiece a escribir
-            if (validationErrors.project_context && e.target.value.trim()) {
-              setValidationErrors({ ...validationErrors, project_context: false });
-            }
-          }}
-          rows={4}
-          className={`form-control ${validationErrors.project_context ? 'error' : ''}`}
-          placeholder="Describe el proyecto, funcionalidades principales, tecnologías utilizadas..."
-          style={{
-            borderColor: validationErrors.project_context ? '#dc2626' : undefined,
-            boxShadow: validationErrors.project_context ? '0 0 0 1px #dc2626' : undefined
-          }}
-        />
-        {validationErrors.project_context && (
-          <div style={{ color: '#dc2626', fontSize: '14px', marginTop: '5px' }}>
-            Este campo es obligatorio
-          </div>
-        )}
-      </div>
-
-      <div className="action-buttons">
+      <div className="action-buttons" style={{ marginTop: '1rem' }}>
         <button
           type="button"
           className="btn btn-secondary"
@@ -1304,125 +1630,186 @@ ${testCasesList}
     </div>
   );
 
-  // Renderizar resultados con chat
+  // Renderizar resultados con tabla de casos y chat
   const renderResults = () => (
     <div className="step-content">
-      <h2 style={{ color: '#1e293b', marginBottom: '30px', textAlign: 'center' }}>
-        💬 Chat con Knowledge Base
-      </h2>
-      
-      {/* Resumen del plan generado */}
-      {testPlan && (
-        <div className="plan-summary chat-mode">
-          <h3>✅ Plan Generado</h3>
-          <div className="summary-stats">
-            <div className="stat-item">
-              <div className="stat-label">Casos</div>
-              <div className="stat-value">{testPlan.test_cases.length}</div>
-            </div>
-            <div className="stat-item">
-              <div className="stat-label">Tipo</div>
-              <div className="stat-value">{planConfig?.plan_type}</div>
-            </div>
-            <div className="stat-item">
-              <div className="stat-label">Cobertura</div>
-              <div className="stat-value">{testPlan.coverage_metrics.target_coverage}%</div>
+      {/* Contenedor principal dividido en dos secciones */}
+      <div className="results-container">
+        {/* Sección 1: Tabla de casos de prueba */}
+        <div className="test-cases-section">
+          <div className="section-header">
+            <h3>📝 Casos de Prueba Generados</h3>
+            <div className="section-actions">
+              <button
+                type="button"
+                className="btn btn-primary btn-small"
+                onClick={() => setShowPreviewModal(true)}
+                disabled={!testPlan}
+              >
+                📊 Exportar
+              </button>
             </div>
           </div>
-        </div>
-      )}
-
-      {/* Interfaz de chat */}
-      <div className="chat-container">
-        {/* Header del chat */}
-        <div className="chat-header">
-          <div className="chat-header-icon">🤖</div>
-          <div className="chat-header-text">
-            <div className="chat-header-title">Asistente de Knowledge Base</div>
-            <div className="chat-header-subtitle">Pregúntame sobre tu plan de pruebas</div>
-          </div>
-          <div className="chat-status">
-            <div className="chat-status-indicator"></div>
-            Conectado
-          </div>
-        </div>
-
-        {/* Mensajes del chat */}
-        <div className="chat-messages" ref={chatMessagesRef}>
-          {chatMessages.map((message, index) => (
-            <div key={index} className={`chat-message ${message.role}`}>
-              <div className="chat-message-avatar">
-                {message.role === 'user' ? '👤' : message.role === 'assistant' ? '🤖' : '💡'}
-              </div>
-              <div className="chat-message-content">
-                <div className="chat-message-bubble">
-                  {message.content}
-                </div>
-                <div className="chat-message-time">
-                  {new Date(message.timestamp).toLocaleTimeString()}
-                </div>
-              </div>
-            </div>
-          ))}
           
-          {/* Indicador de escritura */}
-          {isTyping && (
-            <div className="chat-message assistant">
-              <div className="chat-message-avatar">🤖</div>
-              <div className="chat-message-content">
-                <div className="chat-typing">
-                  <div className="chat-typing-dots">
-                    <div className="chat-typing-dot"></div>
-                    <div className="chat-typing-dot"></div>
-                    <div className="chat-typing-dot"></div>
-                  </div>
-                  <div className="chat-typing-text">Escribiendo...</div>
-                </div>
-              </div>
+          {testPlan && testPlan.test_cases.length > 0 ? (
+            <div className="test-cases-table-container">
+              <table className="test-cases-table">
+                <thead>
+                  <tr>
+                    <th>#</th>
+                    <th>Nombre del Caso</th>
+                    <th>Descripción</th>
+                    <th>Prioridad</th>
+                    <th>Interacción</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {testPlan.test_cases.map((testCase, index) => (
+                    <tr 
+                      key={index}
+                      onClick={() => {
+                        setSelectedTestCase({ ...testCase, index });
+                        setShowPreviewModal(true);
+                      }}
+                      className="clickable-row"
+                    >
+                      <td className="case-number-cell">
+                        <span className="case-number-badge">
+                          TC_{String(index + 1).padStart(3, '0')}
+                        </span>
+                      </td>
+                      <td className="case-name-cell">
+                        <div className="case-name">{testCase.test_case_name}</div>
+                      </td>
+                      <td className="case-description-cell">
+                        <div className="case-description-truncated">
+                          {testCase.test_case_description}
+                        </div>
+                      </td>
+                      <td className="case-priority-cell">
+                        <span className={`priority-badge priority-${testCase.priority?.toLowerCase()}`}>
+                          {testCase.priority}
+                        </span>
+                      </td>
+                      <td className="case-interaction-cell">
+                        <button
+                          className="btn-delete"
+                          onClick={(e) => {
+                            e.stopPropagation(); // Evitar que se abra el modal de detalles
+                            handleDeleteTestCase(index);
+                          }}
+                        >
+                          Eliminar
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <div className="no-cases-message">
+              <div className="no-cases-icon">📄</div>
+              <div className="no-cases-text">No hay casos de prueba generados</div>
+              <div className="no-cases-subtext">Genera un plan para ver los casos aquí</div>
             </div>
           )}
         </div>
 
-        {/* Sugerencias de chat */}
-        <div className="chat-suggestions">
-          {[
-            "¿Puedes explicar los casos de prueba generados?",
-            "¿Cómo puedo modificar la cobertura del plan?",
-            "¿Qué casos adicionales recomiendas?",
-            "¿Puedes revisar un caso específico?"
-          ].map((suggestion, index) => (
-            <div
-              key={index}
-              className="chat-suggestion"
-              onClick={() => handleSuggestionClick(suggestion)}
-            >
-              {suggestion}
+        {/* Sección 2: Chat con asistente */}
+        <div className="chat-section">
+          <div className="chat-container">
+            {/* Header del chat */}
+            <div className="chat-header">
+              <div className="chat-header-icon">🤖</div>
+              <div className="chat-header-text">
+                <div className="chat-header-title">Asistente IA</div>
+                <div className="chat-header-subtitle">Pregúntame sobre tu plan</div>
+              </div>
+              <div className="chat-status">
+                <div className="chat-status-indicator"></div>
+                Conectado
+              </div>
             </div>
-          ))}
-        </div>
 
-        {/* Input del chat */}
-        <div className="chat-input-container">
-          <textarea
-            className="chat-input"
-            value={chatInput}
-            onChange={(e) => setChatInput(e.target.value)}
-            onKeyPress={handleKeyPress}
-            placeholder="Pregúntame sobre el plan de pruebas, modificaciones, cobertura..."
-            rows={1}
-            disabled={isChatLoading}
-          />
-          <button
-            className="chat-send-button"
-            onClick={handleSendMessage}
-            disabled={!chatInput.trim() || isChatLoading}
-          >
-            {isChatLoading ? (
-              <div className="loading-spinner" style={{ width: '16px', height: '16px' }}></div>
-            ) : (
-              '➤'
-            )}
-          </button>
+            {/* Mensajes del chat */}
+            <div className="chat-messages" ref={chatMessagesRef}>
+              {chatMessages.map((message, index) => (
+                <div key={index} className={`chat-message ${message.role}`}>
+                  <div className="chat-message-avatar">
+                    {message.role === 'user' ? '👤' : message.role === 'assistant' ? '🤖' : '💡'}
+                  </div>
+                  <div className="chat-message-content">
+                    <div className="chat-message-bubble">
+                      {message.content}
+                    </div>
+                    <div className="chat-message-time">
+                      {new Date(message.timestamp).toLocaleTimeString()}
+                    </div>
+                  </div>
+                </div>
+              ))}
+              
+              {/* Indicador de escritura */}
+              {isTyping && (
+                <div className="chat-message assistant">
+                  <div className="chat-message-avatar">🤖</div>
+                  <div className="chat-message-content">
+                    <div className="chat-typing">
+                      <div className="chat-typing-dots">
+                        <div className="chat-typing-dot"></div>
+                        <div className="chat-typing-dot"></div>
+                        <div className="chat-typing-dot"></div>
+                      </div>
+                      <div className="chat-typing-text">Escribiendo...</div>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Sugerencias de chat */}
+            <div className="chat-suggestions">
+              {[
+                "¿Puedes explicar los casos generados?",
+                "¿Cómo modificar la cobertura?",
+                "¿Qué casos adicionales recomiendas?",
+                "¿Puedes revisar un caso específico?"
+              ].map((suggestion, index) => (
+                <div
+                  key={index}
+                  className="chat-suggestion"
+                  onClick={() => handleSuggestionClick(suggestion)}
+                >
+                  {suggestion}
+                </div>
+              ))}
+            </div>
+
+            {/* Input del chat */}
+            <div className="chat-input-container">
+              <textarea
+                className="chat-input"
+                value={chatInput}
+                onChange={(e) => setChatInput(e.target.value)}
+                onKeyPress={handleKeyPress}
+                placeholder="Pregúntame sobre el plan de pruebas..."
+                rows={1}
+                disabled={isChatLoading}
+              />
+              <button
+                className="chat-send-button"
+                onClick={handleSendMessage}
+                disabled={!chatInput.trim() || isChatLoading}
+              >
+                {isChatLoading ? (
+                  <div className="loading-spinner" style={{ width: '16px', height: '16px' }}></div>
+                ) : (
+                  '➤'
+                )}
+              </button>
+            </div>
+          </div>
         </div>
       </div>
 
@@ -1444,7 +1831,7 @@ ${testCasesList}
               plan_type: 'UNITARIAS' as PlanType,
               coverage_percentage: 80,
               min_test_cases: 5,
-              max_test_cases: 15,
+              max_test_cases: 8,
               project_context: '',
             });
           }}
@@ -1466,14 +1853,6 @@ ${testCasesList}
             '📊 Calcular Cobertura'
           )}
         </button>
-        <button
-          type="button"
-          className="btn btn-primary"
-          onClick={() => setShowPreviewModal(true)}
-          disabled={!testPlan}
-        >
-          👁️ Vista Previa
-        </button>
       </div>
     </div>
   );
@@ -1484,7 +1863,6 @@ ${testCasesList}
         {/* Header con estilo del MVP */}
         <div className="app-header">
           <h1>{appConfig.app.name}</h1>
-          <p>{appConfig.app.description}</p>
         </div>
 
         {/* Card principal */}
@@ -1533,6 +1911,23 @@ ${testCasesList}
 
         {/* Modal de vista previa */}
         {renderPreviewModal()}
+
+        {/* Popup de confirmación de eliminación */}
+        {showUndoPopup && deletedCase && (
+          <div className="undo-popup">
+            <div className="undo-popup-content">
+              <span className="undo-popup-text">
+                Se ha eliminado el caso "{deletedCase.case.test_case_name}"
+              </span>
+              <button
+                className="undo-button"
+                onClick={handleUndoDelete}
+              >
+                Deshacer
+              </button>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
