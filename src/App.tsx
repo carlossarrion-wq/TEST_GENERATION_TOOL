@@ -51,6 +51,11 @@ const App: React.FC = () => {
   const [showUndoPopup, setShowUndoPopup] = useState(false);
   const [undoTimer, setUndoTimer] = useState<number | null>(null);
 
+  // Estados para edición de casos
+  const [isEditingCase, setIsEditingCase] = useState(false);
+  const [editingCaseData, setEditingCaseData] = useState<any>(null);
+  const [originalCaseData, setOriginalCaseData] = useState<any>(null);
+
 
   // Verificar configuración al cargar
   useEffect(() => {
@@ -413,6 +418,100 @@ ${errorMessage}`;
     return JSON.stringify(exportData, null, 2);
   };
 
+  // Función para generar contenido BDD/Gherkin
+  const generateBDDContent = (testPlan: TestPlan, planConfig: PlanConfiguration) => {
+    const featureName = planConfig.plan_title || 'Plan de Pruebas';
+    const projectContext = planConfig.project_context || 'Funcionalidades del sistema';
+    
+    let bddContent = `# ${featureName}\n# Generado automáticamente el ${new Date().toLocaleDateString()}\n\n`;
+    
+    bddContent += `Feature: ${featureName}\n`;
+    bddContent += `  Como tester del sistema\n`;
+    bddContent += `  Quiero ejecutar pruebas ${planConfig.plan_type.toLowerCase()}\n`;
+    bddContent += `  Para garantizar ${planConfig.coverage_percentage}% de cobertura\n\n`;
+    bddContent += `  Background:\n`;
+    bddContent += `    Given que el sistema está configurado correctamente\n`;
+    bddContent += `    And el entorno de pruebas está disponible\n\n`;
+
+    testPlan.test_cases.forEach((testCase, index) => {
+      // Convertir el nombre del caso a formato más legible para BDD
+      const scenarioName = testCase.test_case_name || `Caso de prueba ${index + 1}`;
+      
+      bddContent += `  Scenario: ${scenarioName}\n`;
+      bddContent += `    # ${testCase.test_case_description}\n`;
+      bddContent += `    # Prioridad: ${testCase.priority}\n\n`;
+      
+      // Precondiciones como Given
+      if (testCase.preconditions && testCase.preconditions.trim() !== '' && testCase.preconditions !== 'No especificadas') {
+        const preconditions = testCase.preconditions.split(/[.\n]/).filter(p => p.trim() !== '');
+        preconditions.forEach(precondition => {
+          if (precondition.trim()) {
+            bddContent += `    Given ${precondition.trim()}\n`;
+          }
+        });
+      } else {
+        bddContent += `    Given las precondiciones están establecidas\n`;
+      }
+      
+      // Pasos de prueba como When
+      if (testCase.test_steps) {
+        const steps = Array.isArray(testCase.test_steps) 
+          ? testCase.test_steps 
+          : (testCase.test_steps as string).split(/\n/).filter((s: string) => s.trim() !== '');
+        
+        steps.forEach((step: string, stepIndex: number) => {
+          if (step.trim()) {
+            const stepText = step.trim().replace(/^\d+\.?\s*/, ''); // Remover numeración
+            if (stepIndex === 0) {
+              bddContent += `    When ${stepText}\n`;
+            } else {
+              bddContent += `    And ${stepText}\n`;
+            }
+          }
+        });
+      } else {
+        bddContent += `    When se ejecuta la funcionalidad\n`;
+      }
+      
+      // Resultados esperados como Then
+      if (testCase.expected_results && testCase.expected_results.trim() !== '') {
+        const results = testCase.expected_results.split(/[.\n]/).filter(r => r.trim() !== '');
+        results.forEach((result, resultIndex) => {
+          if (result.trim()) {
+            if (resultIndex === 0) {
+              bddContent += `    Then ${result.trim()}\n`;
+            } else {
+              bddContent += `    And ${result.trim()}\n`;
+            }
+          }
+        });
+      } else {
+        bddContent += `    Then el sistema responde correctamente\n`;
+      }
+      
+      // Datos de prueba como comentario
+      if (testCase.test_data && testCase.test_data.trim() !== '' && testCase.test_data !== 'No especificados') {
+        bddContent += `    # Datos de prueba: ${testCase.test_data}\n`;
+      }
+      
+      // Requisitos como comentario
+      if (testCase.requirements && testCase.requirements.trim() !== '' && testCase.requirements !== 'No especificados') {
+        bddContent += `    # Requisitos: ${testCase.requirements}\n`;
+      }
+      
+      bddContent += `\n`;
+    });
+    
+    // Agregar información adicional al final
+    bddContent += `# Información del Plan:\n`;
+    bddContent += `# - Tipo de pruebas: ${planConfig.plan_type}\n`;
+    bddContent += `# - Cobertura objetivo: ${planConfig.coverage_percentage}%\n`;
+    bddContent += `# - Total de casos: ${testPlan.test_cases.length}\n`;
+    bddContent += `# - Contexto del proyecto: ${projectContext}\n`;
+    
+    return bddContent;
+  };
+
   // Función para generar CSV compatible con Excel
   const generateExcelCSVContent = (testPlan: TestPlan, planConfig: PlanConfiguration) => {
     // Información del plan
@@ -541,6 +640,35 @@ ${errorMessage}`;
     }
   };
 
+  // Función para descargar BDD/Gherkin
+  const handleDownloadBDD = async () => {
+    if (!testPlan || !planConfig) return;
+
+    setExportLoading(true);
+    try {
+      const content = generateBDDContent(testPlan, planConfig);
+      const fileName = `plan_${planConfig.plan_title?.replace(/[^a-zA-Z0-9]/g, '_') || 'pruebas'}_${new Date().toISOString().split('T')[0]}.feature`;
+      
+      const blob = new Blob([content], { type: 'text/plain;charset=utf-8;' });
+      const url = window.URL.createObjectURL(blob);
+      
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = fileName;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      window.URL.revokeObjectURL(url);
+      
+      logger.info('BDD/Gherkin descargado exitosamente', { fileName });
+      setShowPreviewModal(false);
+    } catch (err) {
+      logger.error('Error al descargar BDD:', err);
+    } finally {
+      setExportLoading(false);
+    }
+  };
+
   // Función para calcular cobertura
   const handleCalculateCoverage = async () => {
     logger.info('=== HANDLE_CALCULATE_COVERAGE STARTED ===');
@@ -620,8 +748,7 @@ ${errorMessage}`;
 
     const initialMessage: ConversationMessage = {
       role: 'system',
-      content: `¡Hola! 👋 He generado exitosamente tu plan de pruebas personalizado.\n\n\n📋 PLAN DE PRUEBAS: ${planConfig.plan_title}\n\n\n🎯 INFORMACIÓN DEL PLAN\n• Tipo de pruebas: ${planConfig.plan_type}\n• Cobertura objetivo: ${planConfig.coverage_percentage}%\n• Casos generados: ${testPlan.test_cases.length} casos de prueba\n• Rango solicitado: ${planConfig.min_test_cases} - ${planConfig.max_test_cases} casos\n\n\n📝 CASOS DE PRUEBA GENERADOS\n\n${testPlan.test_cases.map((testCase, index) => 
-  `${index + 1}. ${testCase.test_case_name}\n📄 Descripción: ${testCase.test_case_description}\n🎯 Prioridad: ${testCase.priority}\n⚙️ Precondiciones: ${testCase.preconditions}\n✅ Resultado esperado: ${testCase.expected_results}\n\n`).join('')}💬 ¿CÓMO PUEDO AYUDARTE?\n\nPuedes preguntarme sobre:\n• Detalles específicos de cualquier caso de prueba\n• Sugerencias para mejorar la cobertura\n• Modificaciones o casos adicionales\n• Explicaciones sobre la metodología utilizada\n\n¡Estoy aquí para ayudarte a perfeccionar tu plan de pruebas! 🚀`,
+      content: `¡Hola! 👋 He generado exitosamente tu plan de pruebas personalizado.\n\n📋 **PLAN DE PRUEBAS:** ${planConfig.plan_title}\n\n🎯 **INFORMACIÓN DEL PLAN**\n• Tipo de pruebas: ${planConfig.plan_type}\n• Cobertura objetivo: ${planConfig.coverage_percentage}%\n• Casos generados: ${testPlan.test_cases.length} casos de prueba\n• Rango solicitado: ${planConfig.min_test_cases} - ${planConfig.max_test_cases} casos\n\n💬 **¿CÓMO PUEDO AYUDARTE?**\n\nPuedes preguntarme sobre:\n• Detalles específicos de cualquier caso de prueba\n• Sugerencias para mejorar la cobertura\n• Modificaciones o casos adicionales\n• Explicaciones sobre la metodología utilizada\n\n¡Estoy aquí para ayudarte a perfeccionar tu plan de pruebas! 🚀`,
       timestamp: new Date().toISOString(),
     };
 
@@ -967,6 +1094,78 @@ ${errorMessage}`;
     };
   }, [undoTimer]);
 
+  // Funciones para edición de casos
+  const handleStartEditing = () => {
+    if (!selectedTestCase) return;
+    
+    setOriginalCaseData({ ...selectedTestCase });
+    setEditingCaseData({ ...selectedTestCase });
+    setIsEditingCase(true);
+  };
+
+  const handleSaveChanges = () => {
+    if (!editingCaseData || !testPlan || selectedTestCase === null) return;
+
+    // Actualizar el caso en el testPlan
+    const updatedTestCases = [...testPlan.test_cases];
+    updatedTestCases[selectedTestCase.index] = {
+      ...editingCaseData,
+      last_modified: new Date().toISOString()
+    };
+
+    const updatedTestPlan = {
+      ...testPlan,
+      test_cases: updatedTestCases,
+      updated_at: new Date().toISOString()
+    };
+
+    setTestPlan(updatedTestPlan);
+    
+    // Actualizar el caso seleccionado con los nuevos datos
+    setSelectedTestCase({
+      ...editingCaseData,
+      index: selectedTestCase.index,
+      last_modified: new Date().toISOString()
+    });
+
+    // Salir del modo edición
+    setIsEditingCase(false);
+    setEditingCaseData(null);
+    setOriginalCaseData(null);
+  };
+
+  const handleCancelEditing = () => {
+    // Restaurar datos originales
+    if (originalCaseData) {
+      setSelectedTestCase(originalCaseData);
+    }
+    
+    // Salir del modo edición
+    setIsEditingCase(false);
+    setEditingCaseData(null);
+    setOriginalCaseData(null);
+  };
+
+  const handleEditingFieldChange = (field: string, value: string | string[]) => {
+    if (!editingCaseData) return;
+    
+    setEditingCaseData({
+      ...editingCaseData,
+      [field]: value
+    });
+  };
+
+  // Función para manejar el cierre del modal
+  const handleCloseModal = () => {
+    if (isEditingCase) {
+      // Si está editando, cancelar la edición
+      handleCancelEditing();
+    }
+    
+    setShowPreviewModal(false);
+    setSelectedTestCase(null);
+  };
+
   // Renderizar modal de vista previa
   const renderPreviewModal = () => {
     if (!showPreviewModal || !testPlan || !planConfig) return null;
@@ -1013,87 +1212,184 @@ ${errorMessage}`;
                   {/* Nombre del Caso - Siempre se muestra */}
                   <div className="detail-section">
                     <h4>📝 Nombre del Caso</h4>
-                    <p>{selectedTestCase.test_case_name}</p>
+                    {isEditingCase ? (
+                      <input
+                        type="text"
+                        className="form-control"
+                        value={editingCaseData?.test_case_name || ''}
+                        onChange={(e) => handleEditingFieldChange('test_case_name', e.target.value)}
+                        placeholder="Nombre del caso de prueba"
+                      />
+                    ) : (
+                      <p>{selectedTestCase.test_case_name}</p>
+                    )}
                   </div>
 
                   {/* Descripción - Siempre se muestra */}
                   <div className="detail-section">
                     <h4>📄 Descripción</h4>
-                    <p>{selectedTestCase.test_case_description}</p>
+                    {isEditingCase ? (
+                      <textarea
+                        className="form-control"
+                        rows={3}
+                        value={editingCaseData?.test_case_description || ''}
+                        onChange={(e) => handleEditingFieldChange('test_case_description', e.target.value)}
+                        placeholder="Descripción del caso de prueba"
+                      />
+                    ) : (
+                      <p>{selectedTestCase.test_case_description}</p>
+                    )}
                   </div>
 
                   {/* Prioridad - Siempre se muestra */}
                   <div className="detail-section">
                     <h4>🎯 Prioridad</h4>
-                    <span className={`priority-badge priority-${selectedTestCase.priority?.toLowerCase()}`}>
-                      {selectedTestCase.priority}
-                    </span>
+                    {isEditingCase ? (
+                      <select
+                        className="form-control"
+                        value={editingCaseData?.priority || 'MEDIA'}
+                        onChange={(e) => handleEditingFieldChange('priority', e.target.value)}
+                      >
+                        <option value="ALTA">ALTA</option>
+                        <option value="MEDIA">MEDIA</option>
+                        <option value="BAJA">BAJA</option>
+                      </select>
+                    ) : (
+                      <span className={`priority-badge priority-${selectedTestCase.priority?.toLowerCase()}`}>
+                        {selectedTestCase.priority}
+                      </span>
+                    )}
                   </div>
 
-                  {/* Precondiciones - Solo si tiene contenido */}
-                  {selectedTestCase.preconditions && 
-                   selectedTestCase.preconditions.trim() !== '' && 
-                   selectedTestCase.preconditions !== 'No especificadas' && (
-                    <div className="detail-section">
-                      <h4>⚙️ Precondiciones</h4>
-                      <p>{selectedTestCase.preconditions}</p>
-                    </div>
-                  )}
-
-                  {/* Pasos de Prueba - Solo si tiene contenido */}
-                  {((Array.isArray(selectedTestCase.test_steps) && selectedTestCase.test_steps.length > 0) ||
-                    (selectedTestCase.test_steps && 
-                     selectedTestCase.test_steps.trim() !== '' && 
-                     selectedTestCase.test_steps !== 'No especificados')) && (
-                    <div className="detail-section">
-                      <h4>📋 Pasos de Prueba</h4>
-                      {Array.isArray(selectedTestCase.test_steps) ? (
-                        <ol className="test-steps-list">
-                          {selectedTestCase.test_steps.map((step, index) => (
-                            <li key={index}>{step}</li>
-                          ))}
-                        </ol>
+                  {/* Precondiciones - Siempre editable en modo edición */}
+                  <div className="detail-section">
+                    <h4>⚙️ Precondiciones</h4>
+                    {isEditingCase ? (
+                      <textarea
+                        className="form-control"
+                        rows={2}
+                        value={editingCaseData?.preconditions || ''}
+                        onChange={(e) => handleEditingFieldChange('preconditions', e.target.value)}
+                        placeholder="Precondiciones del caso de prueba"
+                      />
+                    ) : (
+                      selectedTestCase.preconditions && 
+                      selectedTestCase.preconditions.trim() !== '' && 
+                      selectedTestCase.preconditions !== 'No especificadas' ? (
+                        <p>{selectedTestCase.preconditions}</p>
                       ) : (
-                        <p>{selectedTestCase.test_steps}</p>
-                      )}
-                    </div>
-                  )}
+                        <p style={{ color: '#9ca3af', fontStyle: 'italic' }}>No especificadas</p>
+                      )
+                    )}
+                  </div>
+
+                  {/* Pasos de Prueba - Siempre editable en modo edición */}
+                  <div className="detail-section">
+                    <h4>📋 Pasos de Prueba</h4>
+                    {isEditingCase ? (
+                      <textarea
+                        className="form-control"
+                        rows={4}
+                        value={Array.isArray(editingCaseData?.test_steps) 
+                          ? editingCaseData.test_steps.join('\n') 
+                          : editingCaseData?.test_steps || ''}
+                        onChange={(e) => {
+                          const steps = e.target.value.split('\n').filter(step => step.trim() !== '');
+                          handleEditingFieldChange('test_steps', steps);
+                        }}
+                        placeholder="Escribe los pasos separados por líneas"
+                      />
+                    ) : (
+                      ((Array.isArray(selectedTestCase.test_steps) && selectedTestCase.test_steps.length > 0) ||
+                        (selectedTestCase.test_steps && 
+                         selectedTestCase.test_steps.trim() !== '' && 
+                         selectedTestCase.test_steps !== 'No especificados')) ? (
+                        Array.isArray(selectedTestCase.test_steps) ? (
+                          <ol className="test-steps-list">
+                            {selectedTestCase.test_steps.map((step: string, index: number) => (
+                              <li key={index}>{step}</li>
+                            ))}
+                          </ol>
+                        ) : (
+                          <p>{selectedTestCase.test_steps}</p>
+                        )
+                      ) : (
+                        <p style={{ color: '#9ca3af', fontStyle: 'italic' }}>No especificados</p>
+                      )
+                    )}
+                  </div>
 
                   {/* Resultados Esperados - Siempre se muestra */}
                   <div className="detail-section">
                     <h4>✅ Resultados Esperados</h4>
-                    <p>{selectedTestCase.expected_results}</p>
+                    {isEditingCase ? (
+                      <textarea
+                        className="form-control"
+                        rows={3}
+                        value={editingCaseData?.expected_results || ''}
+                        onChange={(e) => handleEditingFieldChange('expected_results', e.target.value)}
+                        placeholder="Resultados esperados del caso de prueba"
+                      />
+                    ) : (
+                      <p>{selectedTestCase.expected_results}</p>
+                    )}
                   </div>
 
-                  {/* Datos de Prueba - Solo si tiene contenido */}
-                  {selectedTestCase.test_data && 
-                   selectedTestCase.test_data.trim() !== '' && 
-                   selectedTestCase.test_data !== 'No especificados' && (
-                    <div className="detail-section">
-                      <h4>📊 Datos de Prueba</h4>
-                      <p>{selectedTestCase.test_data}</p>
-                    </div>
-                  )}
-
-                  {/* Requisitos - Solo si tiene contenido */}
-                  {selectedTestCase.requirements && 
-                   selectedTestCase.requirements.trim() !== '' && 
-                   selectedTestCase.requirements !== 'No especificados' && (
-                    <div className="detail-section">
-                      <h4>📋 Requisitos</h4>
-                      <p>{selectedTestCase.requirements}</p>
-                    </div>
-                  )}
-
-                  {/* Información Adicional - Siempre se muestra */}
+                  {/* Datos de Prueba - Siempre editable en modo edición */}
                   <div className="detail-section">
-                    <h4>ℹ️ Información Adicional</h4>
-                    <div className="additional-info">
-                      <p><strong>Estado:</strong> {selectedTestCase.status}</p>
-                      <p><strong>Creado por:</strong> {selectedTestCase.created_by}</p>
-                      <p><strong>Última modificación:</strong> {new Date(selectedTestCase.last_modified).toLocaleString()}</p>
-                    </div>
+                    <h4>📊 Datos de Prueba</h4>
+                    {isEditingCase ? (
+                      <textarea
+                        className="form-control"
+                        rows={2}
+                        value={editingCaseData?.test_data || ''}
+                        onChange={(e) => handleEditingFieldChange('test_data', e.target.value)}
+                        placeholder="Datos de prueba necesarios"
+                      />
+                    ) : (
+                      selectedTestCase.test_data && 
+                      selectedTestCase.test_data.trim() !== '' && 
+                      selectedTestCase.test_data !== 'No especificados' ? (
+                        <p>{selectedTestCase.test_data}</p>
+                      ) : (
+                        <p style={{ color: '#9ca3af', fontStyle: 'italic' }}>No especificados</p>
+                      )
+                    )}
                   </div>
+
+                  {/* Requisitos - Siempre editable en modo edición */}
+                  <div className="detail-section">
+                    <h4>📋 Requisitos</h4>
+                    {isEditingCase ? (
+                      <textarea
+                        className="form-control"
+                        rows={2}
+                        value={editingCaseData?.requirements || ''}
+                        onChange={(e) => handleEditingFieldChange('requirements', e.target.value)}
+                        placeholder="Requisitos asociados"
+                      />
+                    ) : (
+                      selectedTestCase.requirements && 
+                      selectedTestCase.requirements.trim() !== '' && 
+                      selectedTestCase.requirements !== 'No especificados' ? (
+                        <p>{selectedTestCase.requirements}</p>
+                      ) : (
+                        <p style={{ color: '#9ca3af', fontStyle: 'italic' }}>No especificados</p>
+                      )
+                    )}
+                  </div>
+
+                  {/* Información Adicional - Solo en modo vista */}
+                  {!isEditingCase && (
+                    <div className="detail-section">
+                      <h4>ℹ️ Información Adicional</h4>
+                      <div className="additional-info">
+                        <p><strong>Estado:</strong> {selectedTestCase.status}</p>
+                        <p><strong>Creado por:</strong> {selectedTestCase.created_by}</p>
+                        <p><strong>Última modificación:</strong> {new Date(selectedTestCase.last_modified).toLocaleString()}</p>
+                      </div>
+                    </div>
+                  )}
                 </div>
               </div>
             ) : (
@@ -1135,17 +1431,37 @@ ${errorMessage}`;
           </div>
 
           <div className="modal-footer">
-            <button 
-              className="btn btn-secondary"
-              onClick={() => {
-                setShowPreviewModal(false);
-                setSelectedTestCase(null);
-              }}
-              disabled={exportLoading}
-            >
-              Cerrar
-            </button>
-            {!selectedTestCase && (
+            {selectedTestCase ? (
+              // Footer para vista de caso individual
+              <>
+                {isEditingCase ? (
+                  // Botones durante edición
+                  <>
+                    <button 
+                      className="btn btn-secondary"
+                      onClick={handleCancelEditing}
+                    >
+                      ❌ Cancelar
+                    </button>
+                    <button 
+                      className="btn btn-primary"
+                      onClick={handleSaveChanges}
+                    >
+                      💾 Guardar Cambios
+                    </button>
+                  </>
+                ) : (
+                  // Botón para iniciar edición
+                  <button 
+                    className="btn btn-primary"
+                    onClick={handleStartEditing}
+                  >
+                    ✏️ Editar Caso
+                  </button>
+                )}
+              </>
+            ) : (
+              // Footer para vista de lista (solo botones de descarga)
               <>
                 <button 
                   className="btn btn-primary"
@@ -1160,6 +1476,13 @@ ${errorMessage}`;
                   disabled={exportLoading}
                 >
                   {exportLoading ? 'Descargando...' : '🔧 Descargar JSON'}
+                </button>
+                <button 
+                  className="btn btn-primary"
+                  onClick={handleDownloadBDD}
+                  disabled={exportLoading}
+                >
+                  {exportLoading ? 'Descargando...' : '🥒 Descargar BDD'}
                 </button>
               </>
             )}
@@ -1308,7 +1631,7 @@ ${errorMessage}`;
               setValidationErrors({ ...validationErrors, project_context: false });
             }
           }}
-          rows={4}
+          rows={6}
           className={`form-control important-field ${validationErrors.project_context ? 'error' : ''}`}
           placeholder="Describe los requisitos del proyecto, funcionalidades a probar, casos de uso principales..."
           style={{
@@ -1418,13 +1741,6 @@ ${errorMessage}`;
               <small style={{ display: 'block', fontSize: '11px', color: '#64748b' }}>Completo</small>
             </div>
           </div>
-          <div className="coverage-description">
-            <strong>Cobertura {formData.coverage_percentage}%:</strong> 
-            {formData.coverage_percentage < 30 && ' Cobertura básica para pruebas esenciales'}
-            {formData.coverage_percentage >= 30 && formData.coverage_percentage < 60 && ' Cobertura moderada para funcionalidades principales'}
-            {formData.coverage_percentage >= 60 && formData.coverage_percentage < 85 && ' Cobertura alta para la mayoría de funcionalidades'}
-            {formData.coverage_percentage >= 85 && ' Cobertura exhaustiva para máxima calidad'}
-          </div>
         </div>
 
         {/* Selector de número de casos con slider dual compacto */}
@@ -1529,14 +1845,6 @@ ${errorMessage}`;
             </div>
           </div>
           
-          <div className="test-cases-description">
-            <strong>Rango: {formData.min_test_cases} - {formData.max_test_cases} casos</strong>
-            <br />
-            {formData.min_test_cases === formData.max_test_cases 
-              ? `Se generarán exactamente ${formData.min_test_cases} casos de prueba`
-              : `Se generarán entre ${formData.min_test_cases} y ${formData.max_test_cases} casos según la complejidad del proyecto`
-            }
-          </div>
         </div>
       </div>
 
